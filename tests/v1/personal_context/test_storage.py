@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
+
 import pytest
 import torch
 
@@ -92,6 +94,30 @@ def test_hash_is_position_independent():
     # property that makes the schema usable for RAG chunk reuse - distinct
     # from vLLM's prefix-rolling block hash, which depends on prior context.
     assert hash_block([10, 20, 30, 40]) == hash_block([10, 20, 30, 40])
+
+
+def test_hash_has_sha256_length():
+    assert len(hash_block([1, 2, 3])) == 32
+
+
+def test_hash_differs_from_naive_sha256():
+    # The domain separator prevents collision with any caller that might
+    # hash raw token bytes - including a hypothetical naive prefix-cache
+    # variant that hashes tokens without prefix context.
+    tokens = [1, 2, 3, 4]
+    naive = hashlib.sha256(
+        b"".join(int(t).to_bytes(4, "big", signed=False) for t in tokens)
+    ).digest()
+    assert hash_block(tokens) != naive
+
+
+def test_hash_differs_from_alternate_domain():
+    # Re-hashing with a different domain string must yield a different
+    # digest. This locks the invariant that our schema cannot collide
+    # with any other schema that picks a different domain prefix.
+    tokens = [1, 2, 3, 4]
+    alt = hashlib.sha256(b"some.other.domain.v1\x00" + bytes(tokens)).digest()
+    assert hash_block(tokens) != alt
 
 
 def test_store_config_is_hashable(config):
