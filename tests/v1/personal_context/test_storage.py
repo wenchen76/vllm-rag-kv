@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm.v1.personal_context import (
+    AlignmentError,
     InMemoryStorage,
     KVBlock,
     StoreConfig,
@@ -95,3 +96,93 @@ def test_hash_is_position_independent():
 
 def test_store_config_is_hashable(config):
     assert hash(config) == hash(config)
+
+
+def _good_block(config: StoreConfig) -> KVBlock:
+    return _make_block(config, old_pos=0)
+
+
+def test_put_rejects_wrong_num_layers(config):
+    store = InMemoryStorage(config)
+    block = _good_block(config)
+    block.keys.pop()
+    with pytest.raises(ValueError, match="key tensors"):
+        store.put(b"k", block)
+
+
+def test_put_rejects_wrong_num_value_layers(config):
+    store = InMemoryStorage(config)
+    block = _good_block(config)
+    block.values.pop()
+    with pytest.raises(ValueError, match="value tensors"):
+        store.put(b"k", block)
+
+
+def test_put_rejects_wrong_block_size(config):
+    store = InMemoryStorage(config)
+    bad_shape = (config.block_size + 1, config.num_kv_heads, config.head_dim)
+    block = KVBlock(
+        keys=[torch.zeros(bad_shape, dtype=config.dtype)
+              for _ in range(config.num_layers)],
+        values=[torch.zeros(bad_shape, dtype=config.dtype)
+                for _ in range(config.num_layers)],
+        old_pos_start=0,
+    )
+    with pytest.raises(ValueError, match="shape"):
+        store.put(b"k", block)
+
+
+def test_put_rejects_wrong_num_kv_heads(config):
+    store = InMemoryStorage(config)
+    bad_shape = (config.block_size, config.num_kv_heads + 1, config.head_dim)
+    block = KVBlock(
+        keys=[torch.zeros(bad_shape, dtype=config.dtype)
+              for _ in range(config.num_layers)],
+        values=[torch.zeros(bad_shape, dtype=config.dtype)
+                for _ in range(config.num_layers)],
+        old_pos_start=0,
+    )
+    with pytest.raises(ValueError, match="shape"):
+        store.put(b"k", block)
+
+
+def test_put_rejects_wrong_head_dim(config):
+    store = InMemoryStorage(config)
+    bad_shape = (config.block_size, config.num_kv_heads, config.head_dim + 1)
+    block = KVBlock(
+        keys=[torch.zeros(bad_shape, dtype=config.dtype)
+              for _ in range(config.num_layers)],
+        values=[torch.zeros(bad_shape, dtype=config.dtype)
+                for _ in range(config.num_layers)],
+        old_pos_start=0,
+    )
+    with pytest.raises(ValueError, match="shape"):
+        store.put(b"k", block)
+
+
+def test_put_rejects_wrong_dtype(config):
+    store = InMemoryStorage(config)
+    shape = (config.block_size, config.num_kv_heads, config.head_dim)
+    block = KVBlock(
+        keys=[torch.zeros(shape, dtype=torch.float32)
+              for _ in range(config.num_layers)],
+        values=[torch.zeros(shape, dtype=torch.float32)
+                for _ in range(config.num_layers)],
+        old_pos_start=0,
+    )
+    with pytest.raises(ValueError, match="dtype"):
+        store.put(b"k", block)
+
+
+def test_put_rejects_misaligned_old_pos_start(config):
+    store = InMemoryStorage(config)
+    block = _make_block(config, old_pos=config.block_size + 1)
+    with pytest.raises(AlignmentError, match="old_pos_start"):
+        store.put(b"k", block)
+
+
+def test_put_rejects_negative_old_pos_start(config):
+    store = InMemoryStorage(config)
+    block = _make_block(config, old_pos=-config.block_size)
+    with pytest.raises(AlignmentError, match="old_pos_start"):
+        store.put(b"k", block)
