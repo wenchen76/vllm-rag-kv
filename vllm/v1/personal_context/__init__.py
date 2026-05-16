@@ -7,6 +7,12 @@ from vllm.v1.personal_context.chunk import (
     Chunk,
     validate_chunk_alignment,
 )
+from vllm.v1.personal_context.connector import (
+    BlockLookup,
+    ChunkLookup,
+    PersonalContextConnector,
+    PlanLookup,
+)
 from vllm.v1.personal_context.entry import KVBlock, StoreConfig
 from vllm.v1.personal_context.hash import hash_block
 from vllm.v1.personal_context.policy import (
@@ -18,9 +24,13 @@ from vllm.v1.personal_context.storage import InMemoryStorage
 
 __all__ = [
     "AlignmentError",
+    "BlockLookup",
     "Chunk",
+    "ChunkLookup",
     "InMemoryStorage",
     "KVBlock",
+    "PersonalContextConnector",
+    "PlanLookup",
     "PrefixCachePollutionError",
     "ReusePlan",
     "StoreConfig",
