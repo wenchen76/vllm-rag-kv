@@ -26,6 +26,13 @@ from vllm.v1.personal_context.policy import (
     ReusePlan,
     assert_can_write_prefix_cache,
 )
+from vllm.v1.personal_context.prefill import (
+    PrefillSetupSpec,
+    build_chunk_aware_mask,
+    build_paged_kv_metadata,
+    run_chunk_aware_prefill,
+    setup_chunk_aware_prefill,
+)
 from vllm.v1.personal_context.rope import (
     apply_delta_rope,
     apply_rope_at_positions,
@@ -44,13 +51,18 @@ __all__ = [
     "LoadedPlan",
     "PersonalContextConnector",
     "PlanLookup",
+    "PrefillSetupSpec",
     "PrefixCachePollutionError",
     "ReusePlan",
     "StoreConfig",
     "apply_delta_rope",
     "apply_rope_at_positions",
     "assert_can_write_prefix_cache",
+    "build_chunk_aware_mask",
+    "build_paged_kv_metadata",
     "hash_block",
     "load_plan",
+    "run_chunk_aware_prefill",
+    "setup_chunk_aware_prefill",
     "validate_chunk_alignment",
 ]
