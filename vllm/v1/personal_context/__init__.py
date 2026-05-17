@@ -15,10 +15,20 @@ from vllm.v1.personal_context.connector import (
 )
 from vllm.v1.personal_context.entry import KVBlock, StoreConfig
 from vllm.v1.personal_context.hash import hash_block
+from vllm.v1.personal_context.load import (
+    LoadedBlock,
+    LoadedChunk,
+    LoadedPlan,
+    load_plan,
+)
 from vllm.v1.personal_context.policy import (
     PrefixCachePollutionError,
     ReusePlan,
     assert_can_write_prefix_cache,
+)
+from vllm.v1.personal_context.rope import (
+    apply_delta_rope,
+    apply_rope_at_positions,
 )
 from vllm.v1.personal_context.storage import InMemoryStorage
 
@@ -29,12 +39,18 @@ __all__ = [
     "ChunkLookup",
     "InMemoryStorage",
     "KVBlock",
+    "LoadedBlock",
+    "LoadedChunk",
+    "LoadedPlan",
     "PersonalContextConnector",
     "PlanLookup",
     "PrefixCachePollutionError",
     "ReusePlan",
     "StoreConfig",
+    "apply_delta_rope",
+    "apply_rope_at_positions",
     "assert_can_write_prefix_cache",
     "hash_block",
+    "load_plan",
     "validate_chunk_alignment",
 ]
