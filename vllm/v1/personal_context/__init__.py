@@ -37,6 +37,10 @@ from vllm.v1.personal_context.rope import (
     apply_delta_rope,
     apply_rope_at_positions,
 )
+from vllm.v1.personal_context.scatter import (
+    scatter_loaded_block,
+    scatter_loaded_plan,
+)
 from vllm.v1.personal_context.storage import InMemoryStorage
 
 __all__ = [
@@ -63,6 +67,8 @@ __all__ = [
     "hash_block",
     "load_plan",
     "run_chunk_aware_prefill",
+    "scatter_loaded_block",
+    "scatter_loaded_plan",
     "setup_chunk_aware_prefill",
     "validate_chunk_alignment",
 ]
