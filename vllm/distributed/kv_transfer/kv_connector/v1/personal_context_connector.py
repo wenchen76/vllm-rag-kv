@@ -46,7 +46,9 @@ from vllm.v1.personal_context.chunk import AlignmentError, Chunk
 from vllm.v1.personal_context.connector import (
     PersonalContextConnector as _StorageLookup,
 )
+from vllm.v1.personal_context.load import load_plan
 from vllm.v1.personal_context.policy import ReusePlan
+from vllm.v1.personal_context.scatter import scatter_loaded_plan
 from vllm.v1.personal_context.storage import InMemoryStorage
 
 if TYPE_CHECKING:
@@ -59,6 +61,20 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _derive_rope_theta(vllm_config: Any) -> float:
+    """Best-effort lookup of the model's RoPE base.
+
+    Production ``VllmConfig`` exposes
+    ``vllm_config.model_config.hf_config.rope_theta``; minimal test
+    fixtures may not. Falls back to ``10000.0`` (the apply_rope default)
+    on any missing attribute or unparseable value.
+    """
+    try:
+        return float(vllm_config.model_config.hf_config.rope_theta)
+    except (AttributeError, TypeError, ValueError):
+        return 10000.0
 
 
 @dataclass(frozen=True)
@@ -153,6 +169,12 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
         # Step 3 state: request_id → (plan, num_external_tokens). Drained
         # by ``build_connector_meta`` (Step 4) once metadata is shipped.
         self._pending_loads: dict[str, _PendingLoad] = {}
+        # Per-model RoPE base; used by ``load_plan`` to compute the
+        # delta rotation. Pull from the model config if available so the
+        # production path picks up the right value automatically; the
+        # 10000.0 fallback matches ``apply_rope_at_positions``'s default
+        # and keeps minimal test fixtures working.
+        self._rope_theta: float = _derive_rope_theta(vllm_config)
 
     def bind_storage(self, storage: InMemoryStorage) -> None:
         """Attach a pre-built storage backend.
@@ -407,8 +429,114 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
         forward_context: "ForwardContext",
         **kwargs: Any,
     ) -> None:
-        """Step 6 stub: load + delta-RoPE + scatter pipeline."""
-        return
+        """Step 5: run lookup + load_plan + scatter_loaded_plan per request.
+
+        For every ``PersonalContextReqMeta`` in the connector metadata
+        bound to this forward pass:
+
+            1. ``_lookup.lookup(meta.plan)`` re-runs the storage probe
+               on the worker-side store (same backend as scheduler).
+            2. ``load_plan(lookup, meta.new_pos_starts, rope_theta)``
+               materialises K (delta-RoPE applied) and V tensors per
+               layer per chunk per block.
+            3. ``scatter_loaded_plan(loaded, kv_caches, block_assignments)``
+               copies them into the paged KV cache at the
+               scheduler-assigned slots.
+
+        Each request is wrapped in its own try block so an
+        ``AlignmentError`` or other failure on one request does not
+        wreck the rest of the batch — the bad request simply gets no
+        K/V loaded and will read garbage on attention, which surfaces
+        loudly downstream. Hard scatter shape / dtype mismatches do
+        ``raise``, since those indicate model/store configuration
+        divergence the caller has to fix.
+
+        No-ops if there is no metadata bound, no requests in it, no
+        worker-side storage bound, or no KV caches discoverable in
+        ``forward_context``.
+        """
+        if not self.has_connector_metadata():
+            return
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, PersonalContextConnectorMetadata):
+            logger.warning(
+                "start_load_kv: bound metadata is %s, not "
+                "PersonalContextConnectorMetadata; skipping.",
+                type(metadata).__name__,
+            )
+            return
+        if not metadata.requests:
+            return
+        if self._lookup is None:
+            logger.warning(
+                "start_load_kv: worker-side storage is not bound but "
+                "%d request(s) are queued for load; skipping.",
+                len(metadata.requests),
+            )
+            return
+        kv_caches = self._extract_kv_caches(forward_context)
+        if not kv_caches:
+            logger.warning(
+                "start_load_kv: no KV cache layers discovered in "
+                "forward_context; skipping load for %d request(s).",
+                len(metadata.requests),
+            )
+            return
+
+        for req_meta in metadata.requests:
+            try:
+                lookup_result = self._lookup.lookup(req_meta.plan)
+            except AlignmentError as e:
+                logger.warning(
+                    "Request %s: alignment error during worker-side "
+                    "lookup: %s. Skipping load (request will read "
+                    "uninitialised KV — fail loudly downstream).",
+                    req_meta.request_id,
+                    e,
+                )
+                continue
+            if not all(c.all_hit for c in lookup_result.chunks):
+                logger.warning(
+                    "Request %s: store miss on worker side (eviction "
+                    "between scheduler and worker?). Skipping load.",
+                    req_meta.request_id,
+                )
+                continue
+            loaded = load_plan(
+                lookup_result,
+                req_meta.new_pos_starts,
+                rope_theta=self._rope_theta,
+            )
+            scatter_loaded_plan(
+                loaded, kv_caches, req_meta.block_assignments
+            )
+
+    def _extract_kv_caches(
+        self, forward_context: "ForwardContext | None"
+    ) -> list[torch.Tensor]:
+        """Pull per-layer paged KV cache tensors from the forward context.
+
+        Returns layers in registration order (``no_compile_layers`` is
+        an insertion-ordered dict). The order must match the per-layer
+        K/V order in ``KVBlock.keys`` so that
+        ``scatter_loaded_plan(loaded, kv_caches, ...)``'s zip lines up.
+
+        Empty list when the context is absent or exposes no layers
+        with a ``kv_cache`` attribute — Step 5 treats that as a no-op
+        skip rather than an error so dry-run / smoke tests can call
+        ``start_load_kv`` without a fully wired model.
+        """
+        if forward_context is None:
+            return []
+        layers = getattr(forward_context, "no_compile_layers", None)
+        if not layers:
+            return []
+        kv_caches: list[torch.Tensor] = []
+        for layer in layers.values():
+            cache = getattr(layer, "kv_cache", None)
+            if cache is not None:
+                kv_caches.append(cache)
+        return kv_caches
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return

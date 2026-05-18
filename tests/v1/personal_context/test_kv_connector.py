@@ -757,3 +757,299 @@ def test_build_meta_is_idempotent_when_empty():
     a = c.build_connector_meta(_scheduler_output(new_reqs=[]))
     b = c.build_connector_meta(_scheduler_output(new_reqs=[]))
     assert a.requests == () and b.requests == ()
+
+
+# ----------------------- start_load_kv (Step 5) -----------------------
+
+
+def _make_kv_caches(num_blocks: int = 8):
+    """Per-layer NHD paged caches, zeroed."""
+    shape = (num_blocks, 2, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM)
+    return [torch.zeros(shape, dtype=torch.float32) for _ in range(NUM_LAYERS)]
+
+
+def _forward_context_with_kvs(kv_caches):
+    """SimpleNamespace shaped like vLLM's ForwardContext.
+
+    PersonalContextKVConnector reads ``forward_context.no_compile_layers``
+    as a name→layer dict; each layer is duck-typed to expose ``.kv_cache``.
+    """
+    layers = {
+        f"layer.{i}": SimpleNamespace(kv_cache=kv)
+        for i, kv in enumerate(kv_caches)
+    }
+    return SimpleNamespace(no_compile_layers=layers)
+
+
+def _bind_meta(
+    connector: PersonalContextKVConnector,
+    req_metas: list[PersonalContextReqMeta],
+):
+    meta = PersonalContextConnectorMetadata(requests=tuple(req_metas))
+    connector.bind_connector_metadata(meta)
+
+
+def _req_meta(
+    request_id: str,
+    chunks: list[Chunk],
+    block_assignments: tuple[tuple[int, ...], ...],
+    new_pos_starts: tuple[int, ...] | None = None,
+) -> PersonalContextReqMeta:
+    if new_pos_starts is None:
+        new_pos_starts = tuple(c.old_pos_start for c in chunks)
+    return PersonalContextReqMeta(
+        request_id=request_id,
+        plan=ReusePlan(chunks=tuple(chunks)),
+        block_assignments=block_assignments,
+        new_pos_starts=new_pos_starts,
+    )
+
+
+# ----- early-exit branches -----
+
+
+def test_start_load_kv_noop_without_metadata():
+    c = _connector()
+    kv_caches = _make_kv_caches()
+    fwd = _forward_context_with_kvs(kv_caches)
+    # No bind_connector_metadata called → has_connector_metadata() == False
+    c.start_load_kv(fwd)
+    for kv in kv_caches:
+        assert torch.all(kv == 0)
+
+
+def test_start_load_kv_noop_with_wrong_metadata_type():
+    c = _connector()
+    kv_caches = _make_kv_caches()
+    fwd = _forward_context_with_kvs(kv_caches)
+
+    # A sibling KVConnectorMetadata subclass (or stand-in) → wrong type.
+    class _OtherMeta(PersonalContextConnectorMetadata.__bases__[0]):
+        pass
+
+    c.bind_connector_metadata(_OtherMeta())
+    c.start_load_kv(fwd)
+    for kv in kv_caches:
+        assert torch.all(kv == 0)
+
+
+def test_start_load_kv_empty_requests_is_noop():
+    c = _connector()
+    kv_caches = _make_kv_caches()
+    fwd = _forward_context_with_kvs(kv_caches)
+    _bind_meta(c, [])
+    c.start_load_kv(fwd)
+    for kv in kv_caches:
+        assert torch.all(kv == 0)
+
+
+def test_start_load_kv_unbound_storage_skips():
+    c = _connector(bind=False)  # No storage bound on worker side.
+    kv_caches = _make_kv_caches()
+    fwd = _forward_context_with_kvs(kv_caches)
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    _bind_meta(c, [_req_meta("x", [chunk], ((1,),))])
+    c.start_load_kv(fwd)
+    for kv in kv_caches:
+        assert torch.all(kv == 0)
+
+
+def test_start_load_kv_missing_layers_skips():
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=40)
+    fwd = SimpleNamespace(no_compile_layers={})
+    _bind_meta(c, [_req_meta("x", [chunk], ((1,),))])
+    # No assertion needed beyond "doesn't crash".
+    c.start_load_kv(fwd)
+
+
+# ----- happy path -----
+
+
+def test_start_load_kv_single_chunk_writes_paged_cache():
+    """delta=0 case: stored K/V == cache slot after scatter."""
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=41)
+    kv_caches = _make_kv_caches()
+    fwd = _forward_context_with_kvs(kv_caches)
+
+    target_block = 3
+    _bind_meta(
+        c,
+        [
+            _req_meta(
+                "r1",
+                [chunk],
+                block_assignments=((target_block,),),
+                new_pos_starts=(0,),
+            )
+        ],
+    )
+    c.start_load_kv(fwd)
+
+    # Stored block should now sit at kv_caches[layer][target_block].
+    stored = c._storage.get(chunk.block_hashes(BLOCK_SIZE)[0])
+    assert stored is not None
+    for layer in range(NUM_LAYERS):
+        torch.testing.assert_close(
+            kv_caches[layer][target_block, 0], stored.keys[layer]
+        )
+        torch.testing.assert_close(
+            kv_caches[layer][target_block, 1], stored.values[layer]
+        )
+
+
+def test_start_load_kv_multi_chunk_per_request():
+    c = _connector()
+    chunk_a = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    chunk_b = Chunk(
+        token_ids=tuple(range(50, 50 + BLOCK_SIZE)),
+        old_pos_start=BLOCK_SIZE,
+    )
+    _store_chunk(c._storage, chunk_a, seed=42)
+    _store_chunk(c._storage, chunk_b, seed=43)
+    kv_caches = _make_kv_caches()
+    fwd = _forward_context_with_kvs(kv_caches)
+
+    _bind_meta(
+        c,
+        [
+            _req_meta(
+                "r2",
+                [chunk_a, chunk_b],
+                block_assignments=((2,), (5,)),
+                new_pos_starts=(0, BLOCK_SIZE),
+            )
+        ],
+    )
+    c.start_load_kv(fwd)
+
+    stored_a = c._storage.get(chunk_a.block_hashes(BLOCK_SIZE)[0])
+    stored_b = c._storage.get(chunk_b.block_hashes(BLOCK_SIZE)[0])
+    for layer in range(NUM_LAYERS):
+        torch.testing.assert_close(kv_caches[layer][2, 0], stored_a.keys[layer])
+        torch.testing.assert_close(kv_caches[layer][5, 0], stored_b.keys[layer])
+        # Untouched blocks stay zeroed.
+        for unused_block in (0, 1, 3, 4, 6, 7):
+            assert torch.all(kv_caches[layer][unused_block] == 0)
+
+
+def test_start_load_kv_multi_request():
+    c = _connector()
+    chunk_a = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    chunk_b = Chunk(token_ids=tuple(range(60, 60 + BLOCK_SIZE)), old_pos_start=0)
+    _store_chunk(c._storage, chunk_a, seed=44)
+    _store_chunk(c._storage, chunk_b, seed=45)
+    kv_caches = _make_kv_caches()
+    fwd = _forward_context_with_kvs(kv_caches)
+
+    _bind_meta(
+        c,
+        [
+            _req_meta("rA", [chunk_a], ((1,),)),
+            _req_meta("rB", [chunk_b], ((4,),)),
+        ],
+    )
+    c.start_load_kv(fwd)
+
+    stored_a = c._storage.get(chunk_a.block_hashes(BLOCK_SIZE)[0])
+    stored_b = c._storage.get(chunk_b.block_hashes(BLOCK_SIZE)[0])
+    for layer in range(NUM_LAYERS):
+        torch.testing.assert_close(kv_caches[layer][1, 0], stored_a.keys[layer])
+        torch.testing.assert_close(kv_caches[layer][4, 0], stored_b.keys[layer])
+
+
+# ----- per-request failure isolation -----
+
+
+def test_start_load_kv_alignment_error_skips_only_bad_request():
+    c = _connector()
+    good = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    bad = Chunk(token_ids=tuple(range(3)), old_pos_start=0)  # length=3, not aligned
+    _store_chunk(c._storage, good, seed=46)
+    kv_caches = _make_kv_caches()
+    fwd = _forward_context_with_kvs(kv_caches)
+
+    _bind_meta(
+        c,
+        [
+            _req_meta("good", [good], ((2,),)),
+            _req_meta("bad", [bad], ((3,),)),
+        ],
+    )
+    c.start_load_kv(fwd)
+
+    stored_good = c._storage.get(good.block_hashes(BLOCK_SIZE)[0])
+    for layer in range(NUM_LAYERS):
+        torch.testing.assert_close(kv_caches[layer][2, 0], stored_good.keys[layer])
+        # block 3 never gets touched (bad request skipped).
+        assert torch.all(kv_caches[layer][3] == 0)
+
+
+def test_start_load_kv_store_miss_skips_request():
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    # Intentionally do NOT store the chunk on worker side.
+    kv_caches = _make_kv_caches()
+    fwd = _forward_context_with_kvs(kv_caches)
+    _bind_meta(c, [_req_meta("miss", [chunk], ((1,),))])
+    c.start_load_kv(fwd)
+    for kv in kv_caches:
+        assert torch.all(kv == 0)
+
+
+# ----- rope_theta plumbing -----
+
+
+def test_rope_theta_default_is_10000():
+    c = _connector()
+    assert c._rope_theta == 10000.0
+
+
+def test_rope_theta_picks_up_model_config_when_present():
+    cfg = _fake_vllm_config()
+    cfg.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(rope_theta=500000.0)
+    )
+    c = PersonalContextKVConnector(cfg, KVConnectorRole.WORKER, _fake_kv_cache_config())
+    assert c._rope_theta == 500000.0
+
+
+def test_rope_theta_threads_through_load_plan():
+    """Loaded K under custom rope_theta differs for non-zero delta."""
+    cfg = _fake_vllm_config()
+    cfg.model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(rope_theta=500000.0)
+    )
+    c_custom = PersonalContextKVConnector(
+        cfg, KVConnectorRole.WORKER, _fake_kv_cache_config()
+    )
+    c_custom.bind_storage(InMemoryStorage(_store_config()))
+    c_default = _connector()
+
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    # Same K/V on both sides (deterministic seed).
+    _store_chunk(c_custom._storage, chunk, seed=50)
+    _store_chunk(c_default._storage, chunk, seed=50)
+
+    kvs_custom = _make_kv_caches()
+    kvs_default = _make_kv_caches()
+
+    # new_pos_start = BLOCK_SIZE → non-zero delta on K.
+    _bind_meta(
+        c_custom,
+        [_req_meta("r", [chunk], ((1,),), new_pos_starts=(BLOCK_SIZE,))],
+    )
+    _bind_meta(
+        c_default,
+        [_req_meta("r", [chunk], ((1,),), new_pos_starts=(BLOCK_SIZE,))],
+    )
+    c_custom.start_load_kv(_forward_context_with_kvs(kvs_custom))
+    c_default.start_load_kv(_forward_context_with_kvs(kvs_default))
+
+    # K differs (different rope_theta);
+    # V identical (position-independent).
+    assert not torch.allclose(kvs_custom[0][1, 0], kvs_default[0][1, 0])
+    torch.testing.assert_close(kvs_custom[0][1, 1], kvs_default[0][1, 1])
