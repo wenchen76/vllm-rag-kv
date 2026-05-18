@@ -16,11 +16,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 from vllm.distributed.kv_transfer.kv_connector.v1.personal_context_connector import (
     PersonalContextConnectorMetadata,
     PersonalContextKVConnector,
+    PersonalContextReqMeta,
 )
 from vllm.v1.personal_context import (
     Chunk,
     InMemoryStorage,
     KVBlock,
+    ReusePlan,
     StoreConfig,
     apply_rope_at_positions,
 )
@@ -93,6 +95,28 @@ def _plan_dict(chunks):
             ]
         }
     }
+
+
+def _new_req(
+    req_id: str,
+    block_ids: list[int],
+    num_computed_tokens: int,
+):
+    """Minimal duck-typed NewRequestData stand-in.
+
+    PersonalContextKVConnector only reads ``.req_id``,
+    ``.block_ids``, and ``.num_computed_tokens``; a SimpleNamespace
+    with those three fields suffices.
+    """
+    return SimpleNamespace(
+        req_id=req_id,
+        block_ids=(list(block_ids),),
+        num_computed_tokens=num_computed_tokens,
+    )
+
+
+def _scheduler_output(new_reqs):
+    return SimpleNamespace(scheduled_new_reqs=list(new_reqs))
 
 
 def _store_chunk(storage: InMemoryStorage, chunk: Chunk, seed: int = 0) -> None:
@@ -325,8 +349,9 @@ def test_factory_registration_returns_the_connector_class():
 
 def test_stubs_are_callable_without_error():
     c = _connector()
-    meta = c.build_connector_meta(scheduler_output=None)
+    meta = c.build_connector_meta(_scheduler_output(new_reqs=[]))
     assert isinstance(meta, PersonalContextConnectorMetadata)
+    assert meta.requests == ()
     c.start_load_kv(forward_context=None)
     c.wait_for_layer_load("layer.0")
     c.save_kv_layer(
@@ -486,3 +511,249 @@ def test_update_state_does_not_validate_storage_hits():
     req = _request(_plan_dict([chunk]), request_id="trust")
     c.update_state_after_alloc(req, blocks=None, num_external_tokens=BLOCK_SIZE)
     assert "trust" in c._pending_loads
+
+
+# ----------------------- build_connector_meta (Step 4) -----------------------
+
+
+def _admit(connector: PersonalContextKVConnector, req_id: str, chunks: list[Chunk]):
+    """Helper: simulate scheduler admission (Step 1-2 + Step 3 chain)."""
+    total = sum(len(c.token_ids) for c in chunks)
+    req = _request(_plan_dict(chunks), request_id=req_id)
+    connector.update_state_after_alloc(
+        req, blocks=None, num_external_tokens=total
+    )
+    return total
+
+
+def test_personal_context_req_meta_is_frozen():
+    plan = ReusePlan(
+        chunks=(Chunk(token_ids=(1, 2, 3, 4), old_pos_start=0),)
+    )
+    meta = PersonalContextReqMeta(
+        request_id="x",
+        plan=plan,
+        block_assignments=((7,),),
+        new_pos_starts=(0,),
+    )
+    with pytest.raises(AttributeError):
+        meta.request_id = "y"  # type: ignore[misc]
+
+
+def test_build_meta_empty_when_no_pending():
+    c = _connector()
+    meta = c.build_connector_meta(_scheduler_output(new_reqs=[]))
+    assert isinstance(meta, PersonalContextConnectorMetadata)
+    assert meta.requests == ()
+
+
+def test_build_meta_drains_pending_loads():
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=20)
+    _admit(c, "drain-1", [chunk])
+    assert "drain-1" in c._pending_loads
+
+    c.build_connector_meta(
+        _scheduler_output([_new_req("drain-1", [42], num_computed_tokens=BLOCK_SIZE)])
+    )
+    assert c._pending_loads == {}
+
+
+def test_build_meta_drops_pending_without_scheduled_match():
+    """Pending entry with no matching scheduled_new_reqs row → drain + no meta."""
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=21)
+    _admit(c, "lost", [chunk])
+
+    meta = c.build_connector_meta(_scheduler_output(new_reqs=[]))
+    assert meta.requests == ()
+    assert c._pending_loads == {}
+
+
+def test_build_meta_ignores_unrelated_scheduled_reqs():
+    c = _connector()
+    out = _scheduler_output(
+        [_new_req("not-ours", [0, 1, 2], num_computed_tokens=BLOCK_SIZE * 3)]
+    )
+    meta = c.build_connector_meta(out)
+    assert meta.requests == ()
+
+
+def test_build_meta_single_chunk_single_block():
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=22)
+    total = _admit(c, "r1", [chunk])
+
+    # 1 block from external + 1 block of remaining prefill = 2 blocks total.
+    out = _scheduler_output(
+        [_new_req("r1", [101, 102], num_computed_tokens=total)]
+    )
+    meta = c.build_connector_meta(out)
+
+    assert len(meta.requests) == 1
+    rm = meta.requests[0]
+    assert rm.request_id == "r1"
+    assert rm.plan.chunks[0].token_ids == chunk.token_ids
+    assert rm.block_assignments == ((101,),)
+    assert rm.new_pos_starts == (0,)
+
+
+def test_build_meta_single_chunk_multi_block():
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE * 3)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=23)
+    total = _admit(c, "r2", [chunk])
+
+    # 3 chunk-blocks + 1 extra for query suffix
+    out = _scheduler_output(
+        [_new_req("r2", [10, 11, 12, 13], num_computed_tokens=total)]
+    )
+    meta = c.build_connector_meta(out)
+
+    rm = meta.requests[0]
+    assert rm.block_assignments == ((10, 11, 12),)
+    assert rm.new_pos_starts == (0,)
+
+
+def test_build_meta_multi_chunk():
+    c = _connector()
+    chunk_a = Chunk(
+        token_ids=tuple(range(BLOCK_SIZE * 2)), old_pos_start=0
+    )
+    chunk_b = Chunk(
+        token_ids=tuple(range(50, 50 + BLOCK_SIZE)),
+        old_pos_start=BLOCK_SIZE * 2,
+    )
+    _store_chunk(c._storage, chunk_a, seed=24)
+    _store_chunk(c._storage, chunk_b, seed=25)
+    total = _admit(c, "r3", [chunk_a, chunk_b])
+
+    # chunk_a uses 2 blocks, chunk_b 1 block. Plus 1 block for query.
+    out = _scheduler_output(
+        [_new_req("r3", [20, 21, 22, 23], num_computed_tokens=total)]
+    )
+    meta = c.build_connector_meta(out)
+
+    rm = meta.requests[0]
+    assert rm.block_assignments == ((20, 21), (22,))
+    assert rm.new_pos_starts == (0, BLOCK_SIZE * 2)
+
+
+def test_build_meta_with_local_prefix():
+    """Local prefix cache already covered some leading blocks."""
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE * 2)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=26)
+    external_total = _admit(c, "r4", [chunk])
+
+    # Pretend local prefix cache covered 2 blocks (positions 0..2*BS).
+    # Our chunk covers the next 2 blocks (positions 2*BS .. 4*BS).
+    local_prefix = BLOCK_SIZE * 2
+    num_computed = local_prefix + external_total
+    out = _scheduler_output(
+        [
+            _new_req(
+                "r4",
+                [200, 201, 202, 203, 204],
+                num_computed_tokens=num_computed,
+            )
+        ]
+    )
+    meta = c.build_connector_meta(out)
+
+    rm = meta.requests[0]
+    # External range starts at block index 2 → block ids [202, 203]
+    assert rm.block_assignments == ((202, 203),)
+    assert rm.new_pos_starts == (local_prefix,)
+
+
+def test_build_meta_multi_request():
+    c = _connector()
+    chunk_a = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    chunk_b = Chunk(token_ids=tuple(range(50, 50 + BLOCK_SIZE * 2)), old_pos_start=0)
+    _store_chunk(c._storage, chunk_a, seed=27)
+    _store_chunk(c._storage, chunk_b, seed=28)
+    total_a = _admit(c, "rA", [chunk_a])
+    total_b = _admit(c, "rB", [chunk_b])
+
+    out = _scheduler_output(
+        [
+            _new_req("rA", [1, 2], num_computed_tokens=total_a),
+            _new_req("rB", [10, 11, 12], num_computed_tokens=total_b),
+        ]
+    )
+    meta = c.build_connector_meta(out)
+
+    assert len(meta.requests) == 2
+    by_id = {r.request_id: r for r in meta.requests}
+    assert by_id["rA"].block_assignments == ((1,),)
+    assert by_id["rB"].block_assignments == ((10, 11),)
+
+
+def test_build_meta_misaligned_local_prefix_drops():
+    """num_computed - num_external must be block-aligned; otherwise drop."""
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=29)
+    _admit(c, "bad-prefix", [chunk])
+
+    # Inject misalignment: num_computed = external + 1 byte → local_prefix=1.
+    out = _scheduler_output(
+        [_new_req("bad-prefix", [33], num_computed_tokens=BLOCK_SIZE + 1)]
+    )
+    meta = c.build_connector_meta(out)
+    assert meta.requests == ()
+
+
+def test_build_meta_negative_local_prefix_drops():
+    """num_external > num_computed is impossible from scheduler; defensive drop."""
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=30)
+    _admit(c, "neg", [chunk])
+
+    out = _scheduler_output(
+        [_new_req("neg", [33], num_computed_tokens=0)]
+    )
+    meta = c.build_connector_meta(out)
+    assert meta.requests == ()
+
+
+def test_build_meta_short_block_ids_drops():
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE * 3)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=31)
+    total = _admit(c, "short", [chunk])
+
+    # Need 3 blocks for the chunk but only 2 supplied.
+    out = _scheduler_output(
+        [_new_req("short", [9, 8], num_computed_tokens=total)]
+    )
+    meta = c.build_connector_meta(out)
+    assert meta.requests == ()
+
+
+def test_build_meta_wrong_kv_cache_group_count_drops():
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=32)
+    total = _admit(c, "multi-group", [chunk])
+
+    # Force two KV cache groups — connector only supports one.
+    new_req = SimpleNamespace(
+        req_id="multi-group",
+        block_ids=([5], [9]),
+        num_computed_tokens=total,
+    )
+    meta = c.build_connector_meta(_scheduler_output([new_req]))
+    assert meta.requests == ()
+
+
+def test_build_meta_is_idempotent_when_empty():
+    c = _connector()
+    a = c.build_connector_meta(_scheduler_output(new_reqs=[]))
+    b = c.build_connector_meta(_scheduler_output(new_reqs=[]))
+    assert a.requests == () and b.requests == ()

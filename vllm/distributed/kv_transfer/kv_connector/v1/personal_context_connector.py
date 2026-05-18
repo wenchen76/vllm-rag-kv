@@ -77,16 +77,54 @@ class _PendingLoad:
     num_external_tokens: int
 
 
+@dataclass(frozen=True)
+class PersonalContextReqMeta:
+    """Worker-side load directive for one personal-context request.
+
+    Carries the minimum Step 5 (``start_load_kv``) needs to run
+
+        loaded_plan = load_plan(lookup_result, new_pos_starts, rope_theta)
+        scatter_loaded_plan(loaded_plan, kv_caches, block_assignments)
+
+    against the worker's local store and paged cache.
+
+    Fields
+    ------
+    request_id
+        Identification only. Useful for logs and per-request cleanup.
+    plan
+        The same ``ReusePlan`` the scheduler-side connector parsed from
+        ``request.kv_transfer_params``. The worker re-runs lookup on its
+        own storage handle against this plan (same backend, so hits are
+        identical modulo eviction races).
+    block_assignments
+        ``block_assignments[i][j]`` is the physical block id where the
+        ``j``-th block of the ``i``-th chunk should land in the paged
+        KV cache. Outer length == ``len(plan.chunks)``; inner length
+        matches each chunk's block count.
+    new_pos_starts
+        ``new_pos_starts[i]`` is the absolute position in this request's
+        prompt where the ``i``-th chunk begins. Used by ``load_plan``
+        to compute the delta-RoPE shift (``delta = new - old``).
+    """
+
+    request_id: str
+    plan: ReusePlan
+    block_assignments: tuple[tuple[int, ...], ...]
+    new_pos_starts: tuple[int, ...]
+
+
 @dataclass
 class PersonalContextConnectorMetadata(KVConnectorMetadata):
     """Scheduler → worker handoff payload.
 
-    Step 4 (``build_connector_meta``) will populate per-request
-    scatter / load directives here. For Step 1-3 it is an empty
-    placeholder so the abstract base type contract is satisfied.
+    ``requests`` enumerates every request whose load is to be performed
+    in this step. The worker-side connector iterates this in
+    ``start_load_kv`` (Step 5). Empty tuple is the legitimate "no load"
+    case (no personal-context requests this step) — not an error.
     """
 
-    pass
+    requests: tuple[PersonalContextReqMeta, ...] = ()
 
 
 class PersonalContextKVConnector(KVConnectorBase_V1):
@@ -256,8 +294,111 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> KVConnectorMetadata:
-        """Step 5 stub: empty metadata; Step 5 will populate."""
-        return PersonalContextConnectorMetadata()
+        """Step 4: drain ``_pending_loads`` into a worker-bound payload.
+
+        For every request stashed by ``update_state_after_alloc``, look
+        it up in ``scheduler_output.scheduled_new_reqs`` to pick up the
+        scheduler-assigned block ids and final ``num_computed_tokens``.
+        Slice the block-id list to the range covering our externally-
+        loaded tokens and split per chunk, then build a
+        ``PersonalContextReqMeta`` per request.
+
+        The local-prefix offset is recovered as
+        ``num_computed_tokens - num_external_tokens``: by the time
+        ``build_connector_meta`` runs, the scheduler has already set
+        ``request.num_computed_tokens`` to ``local + external`` (see
+        scheduler.py:760 / :783), and ``NewRequestData`` captured that
+        same value (output.py:60). Both must be block-aligned by the
+        scheduler's own invariants.
+
+        ``_pending_loads`` is unconditionally cleared at the end —
+        every pending entry is either packaged into the meta or
+        considered dropped (defensive warn). A pending entry never
+        carries over to a later step.
+        """
+        meta_requests: list[PersonalContextReqMeta] = []
+        for new_req in scheduler_output.scheduled_new_reqs:
+            pending = self._pending_loads.get(new_req.req_id)
+            if pending is None:
+                continue
+            req_meta = self._build_req_meta(new_req, pending)
+            if req_meta is not None:
+                meta_requests.append(req_meta)
+        # Any entries left in _pending_loads weren't matched to a
+        # scheduled_new_reqs row this step — that's a state-divergence
+        # symptom (request should have been scheduled the same step it
+        # was admitted). Drop them silently here; the lack of meta will
+        # make Step 5 a no-op for those requests, which is the safe
+        # outcome.
+        self._pending_loads.clear()
+        return PersonalContextConnectorMetadata(
+            requests=tuple(meta_requests)
+        )
+
+    def _build_req_meta(
+        self,
+        new_req: Any,
+        pending: _PendingLoad,
+    ) -> "PersonalContextReqMeta | None":
+        """Pair one ``NewRequestData`` with its pending plan.
+
+        Returns ``None`` (with a warning) on any geometry mismatch —
+        block_ids too short, local-prefix not block-aligned, or
+        per-chunk block count overrunning the slice. Caller treats
+        ``None`` as "drop this load, request will fall back to full
+        prefill".
+        """
+        # Single KV cache group expected for personal-context (Phase 7
+        # MVP scope — multi-group hybrid models are deferred).
+        if len(new_req.block_ids) != 1:
+            logger.warning(
+                "Request %s: expected 1 KV cache group, got %d; "
+                "dropping load.",
+                new_req.req_id,
+                len(new_req.block_ids),
+            )
+            return None
+        all_block_ids = new_req.block_ids[0]
+
+        local_prefix = new_req.num_computed_tokens - pending.num_external_tokens
+        if local_prefix < 0 or local_prefix % self._block_size != 0:
+            logger.warning(
+                "Request %s: unexpected local prefix %d (computed=%d, "
+                "external=%d); dropping load.",
+                new_req.req_id,
+                local_prefix,
+                new_req.num_computed_tokens,
+                pending.num_external_tokens,
+            )
+            return None
+
+        block_cursor = local_prefix // self._block_size
+        block_assignments: list[tuple[int, ...]] = []
+        new_pos_starts: list[int] = []
+        pos_cursor = local_prefix
+        for chunk in pending.plan.chunks:
+            num_blocks = len(chunk.token_ids) // self._block_size
+            end = block_cursor + num_blocks
+            if end > len(all_block_ids):
+                logger.warning(
+                    "Request %s: block_ids range too short for chunk "
+                    "(have %d, need %d); dropping load.",
+                    new_req.req_id,
+                    len(all_block_ids),
+                    end,
+                )
+                return None
+            block_assignments.append(tuple(all_block_ids[block_cursor:end]))
+            new_pos_starts.append(pos_cursor)
+            block_cursor = end
+            pos_cursor += len(chunk.token_ids)
+
+        return PersonalContextReqMeta(
+            request_id=new_req.req_id,
+            plan=pending.plan,
+            block_assignments=tuple(block_assignments),
+            new_pos_starts=tuple(new_pos_starts),
+        )
 
     # ----------------- Worker-side: Step 6-9 stubs -----------------
 
