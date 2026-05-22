@@ -17,11 +17,19 @@ This module exposes two primitives:
       — the plan-wide convenience wrapper; walks chunks × blocks and
       delegates to the per-block primitive.
 
-Layout: NHD only. Each per-layer cache must be a 5-D tensor of shape
-``[num_blocks, 2, page_size, num_kv_heads, head_dim]`` — index 0 along
-dim 1 is K, index 1 is V. This matches the layout assumption used by
-``PrefillSetupSpec`` (Phase 6) and by FlashInfer's NHD path. HND can be
-added later if a backend requires it.
+Layout: two paged-KV layouts are auto-detected by shape:
+
+    - ``block_first`` (FlashInfer NHD convention, also used by Phase 6
+      ``PrefillSetupSpec``): ``[num_blocks, 2, page_size, num_kv_heads,
+      head_dim]`` — dim 1 is the K/V split.
+    - ``kv_first`` (vLLM FlashAttention GPU backend, see
+      ``example_connector.py``'s default branch): ``[2, num_blocks,
+      page_size, num_kv_heads, head_dim]`` — dim 0 is the K/V split.
+
+Detection is by shape: whichever of ``shape[0]`` and ``shape[1]`` equals
+2 is the K/V dim. The degenerate case ``num_blocks == 2`` (only seen in
+contrived unit-test fixtures) is ambiguous and defaults to
+``block_first`` for backward compatibility.
 
 The scatter is pure in-place ``copy_``: no FlashInfer / CUDA kernels.
 It runs unchanged on CPU tensors, which keeps the primitive
@@ -44,6 +52,47 @@ from typing import Sequence
 import torch
 
 from vllm.v1.personal_context.load import LoadedBlock, LoadedPlan
+
+
+def _detect_kv_layout(cache: torch.Tensor) -> str:
+    """Identify whether a paged KV cache tensor is ``block_first`` (NHD,
+    dim 1 is K/V) or ``kv_first`` (vLLM FA backend, dim 0 is K/V).
+
+    Falls back to ``block_first`` in the degenerate ``num_blocks == 2``
+    case so existing CPU test fixtures with tiny ``num_blocks`` keep
+    their original semantics.
+    """
+    if cache.dim() != 5:
+        raise ValueError(
+            f"kv_cache must be 5-D, got shape {tuple(cache.shape)}"
+        )
+    if cache.shape[1] == 2:
+        return "block_first"
+    if cache.shape[0] == 2:
+        return "kv_first"
+    raise ValueError(
+        f"kv_cache shape {tuple(cache.shape)} has neither dim 0 nor "
+        f"dim 1 == 2; cannot identify the K/V split."
+    )
+
+
+def _num_blocks(cache: torch.Tensor, layout: str) -> int:
+    return cache.shape[1] if layout == "kv_first" else cache.shape[0]
+
+
+def _write_kv_to_cache(
+    cache: torch.Tensor,
+    layout: str,
+    block_id: int,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> None:
+    if layout == "block_first":
+        cache[block_id, 0].copy_(k)
+        cache[block_id, 1].copy_(v)
+    else:  # "kv_first"
+        cache[0, block_id].copy_(k)
+        cache[1, block_id].copy_(v)
 
 
 def scatter_loaded_block(
@@ -78,8 +127,9 @@ def scatter_loaded_block(
     for k, v, cache in zip(
         loaded_block.keys, loaded_block.values, kv_caches
     ):
-        cache[physical_block_id, 0].copy_(k)
-        cache[physical_block_id, 1].copy_(v)
+        _write_kv_to_cache(
+            cache, _detect_kv_layout(cache), physical_block_id, k, v
+        )
 
 
 def scatter_loaded_plan(
@@ -147,8 +197,9 @@ def scatter_loaded_plan(
             for k, v, cache in zip(
                 loaded_block.keys, loaded_block.values, kv_caches
             ):
-                cache[assignment, 0].copy_(k)
-                cache[assignment, 1].copy_(v)
+                _write_kv_to_cache(
+                    cache, _detect_kv_layout(cache), assignment, k, v
+                )
 
 
 def _validate_block(
@@ -172,19 +223,21 @@ def _validate_block(
     ):
         if cache.dim() != 5:
             raise ValueError(
-                f"kv_caches[{layer_idx}] must be 5-D NHD "
-                f"[num_blocks, 2, page_size, num_kv_heads, head_dim]; "
-                f"got shape {tuple(cache.shape)}"
+                f"kv_caches[{layer_idx}] must be 5-D; got shape "
+                f"{tuple(cache.shape)}"
             )
-        if cache.shape[1] != 2:
+        try:
+            layout = _detect_kv_layout(cache)
+        except ValueError as e:
             raise ValueError(
-                f"kv_caches[{layer_idx}] dim 1 must be 2 (K, V); got "
-                f"{cache.shape[1]}"
-            )
-        if not 0 <= physical_block_id < cache.shape[0]:
+                f"kv_caches[{layer_idx}]: {e}"
+            ) from None
+        num_blocks = _num_blocks(cache, layout)
+        if not 0 <= physical_block_id < num_blocks:
             raise ValueError(
                 f"physical_block_id {physical_block_id} out of range "
-                f"for kv_caches[{layer_idx}] with {cache.shape[0]} blocks"
+                f"for kv_caches[{layer_idx}] with {num_blocks} blocks "
+                f"(layout={layout})"
             )
         expected = tuple(cache.shape[2:])
         if tuple(k.shape) != expected:

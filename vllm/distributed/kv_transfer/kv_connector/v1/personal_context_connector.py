@@ -192,6 +192,58 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
         # behaviour (no recomputation, ``selected_positions`` always
         # empty). Install via ``bind_selector``.
         self._selector: Selector | None = None
+        # Test-only escape hatch: when ``VLLM_PERSONAL_CONTEXT_TEST_BIND``
+        # is set, load a pickle containing ``{"storage": ..., "selector": ...}``
+        # and bind both sides. Needed for GPU e2e tests where the worker
+        # process is spawned separately from the test process and cannot
+        # be reached via direct ``bind_storage`` / ``bind_selector`` calls.
+        # The env var is inherited by ``multiprocessing.spawn``-launched
+        # workers, so both scheduler-side and worker-side connector
+        # instances see the same pickle.
+        self._maybe_auto_bind_from_env()
+
+    def _maybe_auto_bind_from_env(self) -> None:
+        """If ``VLLM_PERSONAL_CONTEXT_TEST_BIND`` is set, load the pickle
+        at that path and apply ``bind_storage`` / ``bind_selector``.
+
+        Silently no-ops when the env var is absent. Failures (bad path,
+        unpicklable, mismatched block size) log and continue with the
+        unbound default — the test then surfaces the mistake as an
+        assertion failure rather than a confusing import-time crash.
+        """
+        import os
+
+        path = os.environ.get("VLLM_PERSONAL_CONTEXT_TEST_BIND")
+        if not path:
+            return
+        if not os.path.exists(path):
+            logger.warning(
+                "VLLM_PERSONAL_CONTEXT_TEST_BIND=%s does not exist; "
+                "skipping auto-bind.",
+                path,
+            )
+            return
+        try:
+            import pickle
+
+            with open(path, "rb") as f:
+                payload = pickle.load(f)
+        except Exception:
+            logger.exception(
+                "Failed to load PC auto-bind pickle from %s", path
+            )
+            return
+        storage = payload.get("storage")
+        selector = payload.get("selector")
+        if storage is not None:
+            try:
+                self.bind_storage(storage)
+            except Exception:
+                logger.exception(
+                    "Auto bind_storage failed; connector stays unbound."
+                )
+        if selector is not None:
+            self.bind_selector(selector)
 
     def bind_selector(self, selector: Selector | None) -> None:
         """Install (or clear) the stale-KV ``Selector``.

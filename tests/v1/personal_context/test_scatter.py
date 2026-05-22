@@ -112,11 +112,72 @@ def test_scatter_block_rejects_non_5d_cache():
 
 
 def test_scatter_block_rejects_wrong_kv_pair_dim():
+    """Neither dim 0 nor dim 1 equals 2 → can't identify K/V split."""
     block = _make_loaded_block(seed=6)
     bad = [torch.zeros(NUM_PAGES, 3, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM)
            for _ in range(NUM_LAYERS)]
-    with pytest.raises(ValueError, match="dim 1 must be 2"):
+    with pytest.raises(ValueError, match="K/V split"):
         scatter_loaded_block(block, bad, physical_block_id=0)
+
+
+def test_scatter_block_writes_kv_first_layout():
+    """vLLM FlashAttention layout: ``[2, num_blocks, block_size, ...]``.
+
+    Same data should land at ``cache[0, block_id]`` (K) and
+    ``cache[1, block_id]`` (V), not at ``cache[block_id, 0/1]``.
+    """
+    block = _make_loaded_block(seed=100)
+    # KV-first layout: dim 0 is K/V split, dim 1 is num_blocks.
+    caches = [
+        torch.zeros(2, NUM_PAGES, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM)
+        for _ in range(NUM_LAYERS)
+    ]
+    scatter_loaded_block(block, caches, physical_block_id=3)
+
+    for layer in range(NUM_LAYERS):
+        torch.testing.assert_close(
+            caches[layer][0, 3], block.keys[layer], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            caches[layer][1, 3], block.values[layer], rtol=0, atol=0
+        )
+        # Other block ids untouched.
+        for other in range(NUM_PAGES):
+            if other == 3:
+                continue
+            assert torch.all(caches[layer][0, other] == 0)
+            assert torch.all(caches[layer][1, other] == 0)
+
+
+def test_scatter_block_rejects_out_of_range_block_id_kv_first():
+    block = _make_loaded_block(seed=101)
+    caches = [
+        torch.zeros(2, NUM_PAGES, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM)
+        for _ in range(NUM_LAYERS)
+    ]
+    with pytest.raises(ValueError, match="out of range"):
+        scatter_loaded_block(block, caches, physical_block_id=NUM_PAGES)
+    with pytest.raises(ValueError, match="out of range"):
+        scatter_loaded_block(block, caches, physical_block_id=-1)
+
+
+def test_scatter_plan_kv_first_layout_writes_correct_slots():
+    """Plan-level scatter for kv_first cache. Each chunk's blocks
+    should land at ``cache[0, block_id]`` / ``cache[1, block_id]``."""
+    b0 = _make_loaded_block(seed=110)
+    b1 = _make_loaded_block(seed=111)
+    plan = _wrap_plan([[b0, b1]])
+    caches = [
+        torch.zeros(2, NUM_PAGES, BLOCK_SIZE, NUM_KV_HEADS, HEAD_DIM)
+        for _ in range(NUM_LAYERS)
+    ]
+    scatter_loaded_plan(plan, caches, block_assignments=[[1, 4]])
+
+    for layer in range(NUM_LAYERS):
+        torch.testing.assert_close(caches[layer][0, 1], b0.keys[layer])
+        torch.testing.assert_close(caches[layer][1, 1], b0.values[layer])
+        torch.testing.assert_close(caches[layer][0, 4], b1.keys[layer])
+        torch.testing.assert_close(caches[layer][1, 4], b1.values[layer])
 
 
 def test_scatter_block_rejects_block_id_out_of_range():

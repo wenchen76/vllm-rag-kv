@@ -1938,27 +1938,31 @@ class GPUModelRunner(
         self.input_batch.block_table.commit_block_table(num_reqs)
 
         # ===== PersonalContext sparse-Q override (Step 7) =====
-        # When a PersonalContext connector marks some retrieved
-        # positions for recomputation, expand the per-request Q range
-        # from ``[num_computed, num_computed + n_query)`` to
-        # ``sorted(query_positions ∪ selected_positions)`` for those
-        # requests. ``original_num_scheduled`` is preserved because
-        # ``seq_lens`` below still reflects the scheduler's view of
-        # the KV range (sparse-Q recomputes existing positions; it
-        # does not add new KV slots).
-        original_num_scheduled = num_scheduled_tokens
-        pc_overrides = self._pc_collect_selected_positions(
-            scheduler_output, num_reqs
+        # The expansion itself is now performed in ``execute_model``
+        # *before* this point, so ``num_scheduled_tokens`` here is
+        # already the effective (post-PC) per-req Q count and
+        # ``total_num_scheduled_tokens`` from the scheduler output
+        # needs to be replaced with the effective sum. The PC consumer
+        # state is read from ``self._pc_step_*`` attributes set by
+        # the caller; absent attributes mean no PC activity this step.
+        pc_positions_np: np.ndarray | None = getattr(
+            self, "_pc_step_positions_np", None
         )
-        pc_positions_np: np.ndarray | None = None
-        if pc_overrides is not None:
-            (
-                num_scheduled_tokens,
-                total_num_scheduled_tokens,
-                pc_positions_np,
-            ) = self._pc_build_sparse_q_arrays(
-                num_scheduled_tokens, pc_overrides
-            )
+        pc_original_num_scheduled: np.ndarray | None = getattr(
+            self, "_pc_step_original_num_scheduled", None
+        )
+        if pc_positions_np is not None:
+            total_num_scheduled_tokens = int(num_scheduled_tokens.sum())
+        # ``seq_lens`` and the ``num_scheduled_tokens`` GPU buffer must
+        # reflect the scheduler's view of the KV range — sparse-Q
+        # recomputes existing positions, it does not add KV slots.
+        # Fall back to the (effective) ``num_scheduled_tokens`` arg
+        # when PC is not active.
+        seq_lens_basis_np = (
+            pc_original_num_scheduled
+            if pc_original_num_scheduled is not None
+            else num_scheduled_tokens
+        )
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -2072,14 +2076,15 @@ class GPUModelRunner(
         # _build_attention_metadata (max_seq_len) and discard_request_mask.
         # seq_lens (GPU) will be computed later using the same optimistic values.
         #
-        # Use ``original_num_scheduled`` here: PC sparse-Q recomputes
+        # Use ``seq_lens_basis_np`` here: PC sparse-Q recomputes
         # existing positions, so the KV range a request sees is
         # ``num_computed + original_num_scheduled``, NOT the expanded
-        # Q-count. Using the expanded value would overstate seq_lens
-        # and break attention mask shapes.
+        # Q-count. ``seq_lens_basis_np`` is the original (scheduler-
+        # view) per-req count when PC is active, otherwise the
+        # (unchanged) ``num_scheduled_tokens`` arg.
         torch.add(
             self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-            torch.from_numpy(original_num_scheduled),
+            torch.from_numpy(seq_lens_basis_np),
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
@@ -2161,10 +2166,10 @@ class GPUModelRunner(
 
         self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
         # ``self.num_scheduled_tokens`` feeds ``seq_lens`` below — keep
-        # it at the scheduler's view (``original_num_scheduled``) so
+        # it at the scheduler's view (``seq_lens_basis_np``) so
         # PC sparse-Q does not overstate KV ranges. The PC-expanded
         # count only governs the Q tensor shape, not seq_lens.
-        self.num_scheduled_tokens.np[:num_reqs] = original_num_scheduled
+        self.num_scheduled_tokens.np[:num_reqs] = seq_lens_basis_np
         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
         if pc_positions_np is None:
@@ -3448,7 +3453,18 @@ class GPUModelRunner(
         dict[str, Any],
         ECConnectorOutput | None,
     ]:
-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # When PersonalContext sparse-Q expansion is active for this
+        # step, ``execute_model`` has stashed the effective total on
+        # ``self``. Use that instead of the scheduler-view total so
+        # downstream slicing — in particular the ``positions[N:M].zero_()``
+        # padding clear below — does not zero out PC-expanded positions
+        # that already hold valid absolute prompt positions.
+        pc_effective_total = getattr(self, "_pc_step_effective_total", None)
+        num_scheduled_tokens = (
+            pc_effective_total
+            if pc_effective_total is not None
+            else scheduler_output.total_num_scheduled_tokens
+        )
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
 
@@ -4094,8 +4110,38 @@ class GPUModelRunner(
             req_ids = self.input_batch.req_ids
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+
+            # PersonalContext sparse-Q expansion (Step 7). Must happen
+            # before ``num_tokens_unpadded`` / ``max_num_scheduled_tokens``
+            # are derived, because both feed downstream sizing (forward
+            # buffer width, cudagraph padding choice). Without this, the
+            # forward only processes the scheduler-claimed Q count and
+            # the larger Q tensors built by ``_prepare_inputs`` lead to
+            # OOB indexing on the sampling path.
+            pc_overrides = self._pc_collect_selected_positions(
+                scheduler_output, num_reqs
+            )
+            if pc_overrides is not None:
+                self._pc_step_original_num_scheduled = (
+                    num_scheduled_tokens_np.copy()
+                )
+                (
+                    num_scheduled_tokens_np,
+                    num_tokens_unpadded,
+                    self._pc_step_positions_np,
+                ) = self._pc_build_sparse_q_arrays(
+                    num_scheduled_tokens_np, pc_overrides
+                )
+                self._pc_step_effective_total = num_tokens_unpadded
+            else:
+                self._pc_step_original_num_scheduled = None
+                self._pc_step_positions_np = None
+                self._pc_step_effective_total = None
+                num_tokens_unpadded = (
+                    scheduler_output.total_num_scheduled_tokens
+                )
+
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
-            num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
             logits_indices, spec_decode_metadata = self._prepare_inputs(
                 scheduler_output,
