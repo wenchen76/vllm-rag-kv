@@ -1824,6 +1824,97 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    def _pc_collect_selected_positions(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+    ) -> dict[int, tuple[int, ...]] | None:
+        """Map PersonalContext ``selected_positions`` from connector meta
+        to ``req_idx`` keys in the active ``InputBatch``.
+
+        Returns ``None`` when no PersonalContext metadata is bound, or
+        when every request in it has an empty ``selected_positions``
+        (strategy-B MVP). The non-``None`` return drives the sparse-Q
+        override branch below. The lookup-and-import is wrapped in a
+        try/except so vLLM builds without the personal-context module
+        installed don't pay the lookup cost.
+        """
+        try:
+            from vllm.distributed.kv_transfer.kv_connector.v1.personal_context_connector import (  # noqa: E501
+                PersonalContextConnectorMetadata,
+            )
+        except ImportError:
+            return None
+
+        meta = getattr(scheduler_output, "kv_connector_metadata", None)
+        if not isinstance(meta, PersonalContextConnectorMetadata):
+            return None
+
+        overrides: dict[int, tuple[int, ...]] = {}
+        for rm in meta.requests:
+            if not rm.selected_positions:
+                continue
+            req_idx = self.input_batch.req_id_to_index.get(rm.request_id)
+            if req_idx is None or req_idx >= num_reqs:
+                continue
+            overrides[req_idx] = tuple(rm.selected_positions)
+        return overrides if overrides else None
+
+    def _pc_build_sparse_q_arrays(
+        self,
+        num_scheduled_tokens: np.ndarray,
+        pc_overrides: dict[int, tuple[int, ...]],
+    ) -> tuple[np.ndarray, int, np.ndarray]:
+        """Expand ``num_scheduled_tokens`` for PC requests and build the
+        per-token absolute ``positions_np``.
+
+        For PC requests, the per-request Q range becomes
+        ``sorted(query_positions ∪ selected_positions)`` — the standard
+        query suffix expanded with the positions we need to recompute.
+        For non-PC requests in the same batch, the formula is identical
+        to the vanilla one (contiguous from ``num_computed_tokens``).
+
+        Returns:
+            effective_num_scheduled: per-request Q count
+                (always >= the input ``num_scheduled_tokens``).
+            effective_total: ``int(effective_num_scheduled.sum())``.
+            positions_np: ``[effective_total]`` int64 absolute prompt
+                positions, with per-request blocks contiguous and
+                sorted within each block.
+        """
+        num_reqs = len(num_scheduled_tokens)
+        effective = num_scheduled_tokens.astype(np.int64).copy()
+        positions_lists: list[np.ndarray] = []
+        for req_idx in range(num_reqs):
+            num_computed = int(
+                self.input_batch.num_computed_tokens_cpu[req_idx]
+            )
+            n_query = int(num_scheduled_tokens[req_idx])
+            if req_idx in pc_overrides:
+                sel = pc_overrides[req_idx]
+                query_positions = range(
+                    num_computed, num_computed + n_query
+                )
+                combined = sorted(set(sel) | set(query_positions))
+                effective[req_idx] = len(combined)
+                positions_lists.append(
+                    np.array(combined, dtype=np.int64)
+                )
+            else:
+                positions_lists.append(
+                    np.arange(
+                        num_computed,
+                        num_computed + n_query,
+                        dtype=np.int64,
+                    )
+                )
+        positions_np = (
+            np.concatenate(positions_lists)
+            if positions_lists
+            else np.empty((0,), dtype=np.int64)
+        )
+        return effective, int(positions_np.shape[0]), positions_np
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1846,6 +1937,29 @@ class GPUModelRunner(
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
+        # ===== PersonalContext sparse-Q override (Step 7) =====
+        # When a PersonalContext connector marks some retrieved
+        # positions for recomputation, expand the per-request Q range
+        # from ``[num_computed, num_computed + n_query)`` to
+        # ``sorted(query_positions ∪ selected_positions)`` for those
+        # requests. ``original_num_scheduled`` is preserved because
+        # ``seq_lens`` below still reflects the scheduler's view of
+        # the KV range (sparse-Q recomputes existing positions; it
+        # does not add new KV slots).
+        original_num_scheduled = num_scheduled_tokens
+        pc_overrides = self._pc_collect_selected_positions(
+            scheduler_output, num_reqs
+        )
+        pc_positions_np: np.ndarray | None = None
+        if pc_overrides is not None:
+            (
+                num_scheduled_tokens,
+                total_num_scheduled_tokens,
+                pc_positions_np,
+            ) = self._pc_build_sparse_q_arrays(
+                num_scheduled_tokens, pc_overrides
+            )
+
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
         req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
@@ -1857,10 +1971,17 @@ class GPUModelRunner(
         )
 
         # Get positions.
-        positions_np = (
-            self.input_batch.num_computed_tokens_cpu[req_indices]
-            + self.query_pos.np[: cu_num_tokens[-1]]
-        )
+        if pc_positions_np is None:
+            positions_np = (
+                self.input_batch.num_computed_tokens_cpu[req_indices]
+                + self.query_pos.np[: cu_num_tokens[-1]]
+            )
+        else:
+            # PC sparse-Q: positions are not a simple
+            # ``num_computed + offset`` formula — selected positions
+            # can fall *inside* the cached range (i.e. ``< num_computed``).
+            # We carry the absolute positions through unchanged.
+            positions_np = pc_positions_np
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1950,9 +2071,15 @@ class GPUModelRunner(
         # iteration accepted). Store in optimistic_seq_lens_cpu for use by
         # _build_attention_metadata (max_seq_len) and discard_request_mask.
         # seq_lens (GPU) will be computed later using the same optimistic values.
+        #
+        # Use ``original_num_scheduled`` here: PC sparse-Q recomputes
+        # existing positions, so the KV range a request sees is
+        # ``num_computed + original_num_scheduled``, NOT the expanded
+        # Q-count. Using the expanded value would overstate seq_lens
+        # and break attention mask shapes.
         torch.add(
             self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
-            torch.from_numpy(num_scheduled_tokens),
+            torch.from_numpy(original_num_scheduled),
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
         self.optimistic_seq_lens_cpu[num_reqs:].fill_(0)
@@ -2033,13 +2160,28 @@ class GPUModelRunner(
         req_indices_gpu = self.req_indices.gpu[:total_num_scheduled_tokens]
 
         self.query_pos.copy_to_gpu(total_num_scheduled_tokens)
-        self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
+        # ``self.num_scheduled_tokens`` feeds ``seq_lens`` below — keep
+        # it at the scheduler's view (``original_num_scheduled``) so
+        # PC sparse-Q does not overstate KV ranges. The PC-expanded
+        # count only governs the Q tensor shape, not seq_lens.
+        self.num_scheduled_tokens.np[:num_reqs] = original_num_scheduled
         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
-        self.positions[:total_num_scheduled_tokens] = (
-            self.num_computed_tokens[req_indices_gpu].to(torch.int64)
-            + self.query_pos.gpu[:total_num_scheduled_tokens]
-        )
+        if pc_positions_np is None:
+            self.positions[:total_num_scheduled_tokens] = (
+                self.num_computed_tokens[req_indices_gpu].to(torch.int64)
+                + self.query_pos.gpu[:total_num_scheduled_tokens]
+            )
+        else:
+            # PC sparse-Q: copy the absolute positions array we built
+            # on CPU directly into the GPU positions buffer. The
+            # vanilla ``num_computed + query_pos`` formula is wrong for
+            # selected positions that fall inside the cached range
+            # (i.e. positions < num_computed_tokens for that request).
+            self.positions[:total_num_scheduled_tokens].copy_(
+                torch.from_numpy(pc_positions_np),
+                non_blocking=True,
+            )
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
