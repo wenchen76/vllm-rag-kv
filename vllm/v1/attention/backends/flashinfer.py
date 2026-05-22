@@ -881,6 +881,59 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         )
         return paged_kv_indices
 
+    def _build_pc_custom_mask(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_prefills: int,
+        num_decodes: int,
+        qo_indptr_prefill_cpu: torch.Tensor,
+        seq_lens_np: np.ndarray | None,
+    ) -> torch.Tensor | None:
+        """Return a packed FlashInfer ``custom_mask`` over the prefill subset
+        when PersonalContext sparse-Q is active for this batch; ``None``
+        otherwise.
+
+        Sparse-Q expands per-request Q rows to cover both the regular query
+        suffix and the selected chunk positions to recompute. The Q rows are
+        therefore no longer ``range(num_computed, num_computed + n_query)``,
+        and FlashInfer's built-in causal mask (which assumes that layout)
+        would mis-align Q positions with KV columns. Building a CPU mask of
+        shape ``[Q, KV]`` flattened, packed across prefill requests in batch
+        order, sidesteps that.
+        """
+        q_positions_cpu = common_attn_metadata.pc_q_positions_cpu
+        if q_positions_cpu is None or num_prefills == 0:
+            return None
+
+        from vllm.v1.personal_context import build_pc_prefill_custom_mask
+
+        prefill_start = num_decodes
+        # Slice the batch-level Q-positions to the prefill subset using the
+        # *batch-level* qo_indptr in ``common_attn_metadata`` (not the
+        # prefill-local one passed in).
+        qo_indptr_batch_cpu = common_attn_metadata.query_start_loc_cpu
+        q_lo = int(qo_indptr_batch_cpu[prefill_start])
+        q_hi = int(qo_indptr_batch_cpu[prefill_start + num_prefills])
+        q_positions_prefill_cpu = q_positions_cpu[q_lo:q_hi]
+
+        assert seq_lens_np is not None, (
+            "seq_lens_np required when building PC custom_mask"
+        )
+        seq_lens_prefill_cpu = torch.from_numpy(
+            seq_lens_np[prefill_start : prefill_start + num_prefills]
+        )
+
+        # FlashInfer's ``plan()`` runs ``segment_packbits`` (a CUDA kernel)
+        # on ``custom_mask``, so the mask must live on GPU even though the
+        # indptrs are CPU tensors.
+        mask_cpu = build_pc_prefill_custom_mask(
+            num_prefills=num_prefills,
+            qo_indptr_prefill_cpu=qo_indptr_prefill_cpu,
+            q_positions_prefill_cpu=q_positions_prefill_cpu,
+            seq_lens_prefill_cpu=seq_lens_prefill_cpu,
+        )
+        return mask_cpu.to(self.device, non_blocking=True)
+
     def build(
         self,
         common_prefix_len: int,
@@ -1165,16 +1218,56 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     o_dtype = (
                         FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
                     )
+                    # PersonalContext sparse-Q (Step 8): build a chunk-aware
+                    # ``custom_mask`` over the prefill subset when the runner
+                    # signalled sparse-Q activity via ``pc_q_positions_cpu``.
+                    # The mask supersedes ``causal=True``; for select-all it
+                    # is mathematically equivalent so byte-for-byte parity
+                    # with vanilla is preserved.
+                    pc_custom_mask = self._build_pc_custom_mask(
+                        common_attn_metadata=common_attn_metadata,
+                        num_prefills=num_prefills,
+                        num_decodes=num_decodes,
+                        qo_indptr_prefill_cpu=qo_indptr_prefill_cpu,
+                        seq_lens_np=seq_lens_np,
+                    )
+                    # FlashInfer's ``plan()`` accepts CPU indptrs in the
+                    # vanilla causal path, but when ``custom_mask`` is
+                    # provided it routes through ``segment_packbits`` +
+                    # ``_compute_page_mask_indptr`` (CUDA kernels) which
+                    # require *all* indptr / last-page-len tensors to live
+                    # on CUDA. Promote the prefill-subset metadata to GPU
+                    # only on the PC path; the GPU buffers are already
+                    # populated upstream by ``_compute_flashinfer_kv_metadata``.
+                    if pc_custom_mask is not None:
+                        qo_indptr_prefill_plan = (
+                            qo_indptr[prefill_start:]
+                            - qo_indptr[prefill_start]
+                        )
+                        paged_kv_indptr_prefill_plan = self.paged_kv_indptr.gpu[
+                            prefill_start : num_reqs + 1
+                        ]
+                        paged_kv_last_page_len_prefill_plan = (
+                            self.paged_kv_last_page_len.gpu[
+                                prefill_start:num_reqs
+                            ]
+                        )
+                    else:
+                        qo_indptr_prefill_plan = qo_indptr_prefill_cpu
+                        paged_kv_indptr_prefill_plan = paged_kv_indptr_prefill_cpu
+                        paged_kv_last_page_len_prefill_plan = (
+                            paged_kv_last_page_len_prefill_cpu
+                        )
                     prefill_wrapper.plan(
-                        qo_indptr=qo_indptr_prefill_cpu,
-                        paged_kv_indptr=paged_kv_indptr_prefill_cpu,
+                        qo_indptr=qo_indptr_prefill_plan,
+                        paged_kv_indptr=paged_kv_indptr_prefill_plan,
                         paged_kv_indices=paged_kv_indices,
-                        paged_kv_last_page_len=paged_kv_last_page_len_prefill_cpu,
+                        paged_kv_last_page_len=paged_kv_last_page_len_prefill_plan,
                         num_qo_heads=self.num_qo_heads,
                         num_kv_heads=self.num_kv_heads,
                         head_dim_qk=self.head_dim,
                         page_size=self.page_size,
-                        causal=True,
+                        causal=pc_custom_mask is None,
                         sm_scale=self.sm_scale,
                         window_left=self.window_left,
                         logits_soft_cap=self.logits_soft_cap,
@@ -1183,6 +1276,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         o_data_type=o_dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
+                        custom_mask=pc_custom_mask,
                     )
                 attn_metadata.prefill = FIPrefill(wrapper=prefill_wrapper)
 
@@ -1548,7 +1642,11 @@ class FlashInferImpl(AttentionImpl):
                         self.logits_soft_cap or 0.0
                     )
                     assert prefill_wrapper._sm_scale == self.scale
-                    assert prefill_wrapper._causal
+                    # ``_causal`` is False when the wrapper was planned with
+                    # a chunk-aware ``custom_mask`` (PersonalContext sparse-Q,
+                    # Step 8). The mask already encodes the causal constraint
+                    # and is baked into the planned wrapper, so ``.run()`` is
+                    # safe either way — we don't enforce causal-only here.
 
                     if self.is_kvcache_nvfp4:
                         kv_cache_permute = nvfp4_kv_data

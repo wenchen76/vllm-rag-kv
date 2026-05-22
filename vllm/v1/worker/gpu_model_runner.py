@@ -2379,6 +2379,7 @@ class GPUModelRunner(
             causal=True,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
+            pc_q_positions_cpu=getattr(self, "_pc_step_q_positions_cpu", None),
         )
 
         if self.dcp_world_size > 1:
@@ -4133,10 +4134,18 @@ class GPUModelRunner(
                     num_scheduled_tokens_np, pc_overrides
                 )
                 self._pc_step_effective_total = num_tokens_unpadded
+                # CPU view of the expanded Q positions, consumed at plan
+                # time by FlashInferMetadataBuilder to build a chunk-aware
+                # custom_mask (Step 8). Kept as int32 to match
+                # FlashInfer's qo_indptr/paged_kv_indptr dtype convention.
+                self._pc_step_q_positions_cpu = torch.from_numpy(
+                    self._pc_step_positions_np
+                ).to(torch.int32)
             else:
                 self._pc_step_original_num_scheduled = None
                 self._pc_step_positions_np = None
                 self._pc_step_effective_total = None
+                self._pc_step_q_positions_cpu = None
                 num_tokens_unpadded = (
                     scheduler_output.total_num_scheduled_tokens
                 )

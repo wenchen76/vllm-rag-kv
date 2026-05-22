@@ -66,6 +66,47 @@ def build_chunk_aware_mask(
     return mask_2d.flatten().contiguous()
 
 
+def build_pc_prefill_custom_mask(
+    num_prefills: int,
+    qo_indptr_prefill_cpu: torch.Tensor,
+    q_positions_prefill_cpu: torch.Tensor,
+    seq_lens_prefill_cpu: torch.Tensor,
+) -> torch.Tensor:
+    """Pack a FlashInfer-compatible ``custom_mask`` for the prefill subset.
+
+    For each prefill request ``i`` in ``[0, num_prefills)``, the per-request
+    mask is ``q_pos_i[:, None] >= kv_pos_i[None, :]`` where ``q_pos_i`` are
+    the absolute Q positions for that request (possibly sparse-Q expanded)
+    and ``kv_pos_i = arange(seq_lens_prefill_cpu[i])``. The per-request
+    masks are concatenated in batch order into a single flat bool tensor —
+    the layout ``BatchPrefillWithPagedKVCacheWrapper.plan`` expects.
+
+    Args:
+        num_prefills: Number of prefill requests in the batch.
+        qo_indptr_prefill_cpu: ``[num_prefills + 1]`` int32 CPU tensor.
+            Cumulative Q offsets within the prefill subset (i.e. starts at 0).
+        q_positions_prefill_cpu: ``[qo_indptr_prefill_cpu[-1]]`` int CPU tensor
+            of absolute Q positions across all prefill requests, concatenated
+            in batch order.
+        seq_lens_prefill_cpu: ``[num_prefills]`` int CPU tensor of KV lengths
+            per prefill request (full KV range each Q row may attend to).
+
+    Returns:
+        ``[sum_i(q_len_i * kv_len_i)]`` bool CPU tensor.
+    """
+    if num_prefills == 0:
+        return torch.empty((0,), dtype=torch.bool)
+    masks: list[torch.Tensor] = []
+    for i in range(num_prefills):
+        q_start = int(qo_indptr_prefill_cpu[i])
+        q_end = int(qo_indptr_prefill_cpu[i + 1])
+        q_pos = q_positions_prefill_cpu[q_start:q_end]
+        kv_len = int(seq_lens_prefill_cpu[i])
+        kv_pos = torch.arange(kv_len, dtype=q_pos.dtype, device=q_pos.device)
+        masks.append(build_chunk_aware_mask(q_pos, kv_pos))
+    return torch.cat(masks).contiguous()
+
+
 def build_paged_kv_metadata(
     block_ids: Sequence[int],
     total_kv_tokens: int,

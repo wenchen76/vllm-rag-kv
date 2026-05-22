@@ -397,6 +397,15 @@ class CommonAttentionMetadata:
     has positions available so that builders can pre-compute position-dependent
     metadata (e.g. C128A topk indices for DeepSeek V4)."""
 
+    pc_q_positions_cpu: torch.Tensor | None = None
+    """``[num_actual_tokens]`` int CPU tensor of absolute Q positions per
+    token in batch order. Set by the runner when PersonalContext sparse-Q
+    is active so attention backends can detect that Q rows are no longer
+    contiguous-from-num_computed and need a ``custom_mask`` at plan time
+    instead of relying on the built-in ``causal=True`` flag. ``None``
+    means no PC sparse-Q this step — use the backend's default causal
+    behaviour."""
+
     is_prefilling: torch.Tensor | None = None
     """(batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to

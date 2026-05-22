@@ -30,6 +30,7 @@ from vllm.v1.personal_context.prefill import (
     PrefillSetupSpec,
     build_chunk_aware_mask,
     build_paged_kv_metadata,
+    build_pc_prefill_custom_mask,
     run_chunk_aware_prefill,
     setup_chunk_aware_prefill,
 )
@@ -72,6 +73,7 @@ __all__ = [
     "assert_can_write_prefix_cache",
     "build_chunk_aware_mask",
     "build_paged_kv_metadata",
+    "build_pc_prefill_custom_mask",
     "hash_block",
     "load_plan",
     "run_chunk_aware_prefill",
