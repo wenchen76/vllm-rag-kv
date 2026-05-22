@@ -205,6 +205,7 @@ def _run_vanilla(prompt_ids):
         block_size=BLOCK_SIZE,
         gpu_memory_utilization=0.5,
         enforce_eager=True,
+        attention_config={"backend": "FLASHINFER"},
     )
     try:
         out = llm.generate(
@@ -234,6 +235,7 @@ def _run_pc(prompt_ids, chunk, storage, selector):
             gpu_memory_utilization=0.5,
             enforce_eager=True,
             kv_transfer_config=kv_transfer_config,
+            attention_config={"backend": "FLASHINFER"},
         )
         try:
             out = llm.generate(
