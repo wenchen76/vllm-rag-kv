@@ -49,6 +49,7 @@ from vllm.v1.personal_context.connector import (
 from vllm.v1.personal_context.load import load_plan
 from vllm.v1.personal_context.policy import ReusePlan
 from vllm.v1.personal_context.scatter import scatter_loaded_plan
+from vllm.v1.personal_context.selection import Selector
 from vllm.v1.personal_context.storage import InMemoryStorage
 
 if TYPE_CHECKING:
@@ -128,6 +129,18 @@ class PersonalContextReqMeta:
     plan: ReusePlan
     block_assignments: tuple[tuple[int, ...], ...]
     new_pos_starts: tuple[int, ...]
+    selected_positions: tuple[int, ...] = ()
+    """Absolute prompt positions whose K/V should be recomputed.
+
+    Empty == strategy B (every retrieved position is fresh; no
+    recomputation needed). Non-empty == CacheBlend-style stale-KV
+    reuse — Step 7 consumes this to widen the sparse-Q batch from
+    just the query suffix to ``selected_positions ∪ query_positions``.
+
+    Populated by ``build_connector_meta`` via the bound ``Selector``;
+    the default (no selector bound) keeps this empty and the worker-
+    side path identical to the strategy-B MVP.
+    """
 
 
 @dataclass
@@ -175,6 +188,23 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
         # 10000.0 fallback matches ``apply_rope_at_positions``'s default
         # and keeps minimal test fixtures working.
         self._rope_theta: float = _derive_rope_theta(vllm_config)
+        # Step 6.1 stale-KV selection. ``None`` keeps strategy-B
+        # behaviour (no recomputation, ``selected_positions`` always
+        # empty). Install via ``bind_selector``.
+        self._selector: Selector | None = None
+
+    def bind_selector(self, selector: Selector | None) -> None:
+        """Install (or clear) the stale-KV ``Selector``.
+
+        ``None`` reverts to the strategy-B default — every retrieved
+        position is treated as fresh and ``selected_positions`` stays
+        empty. A bound selector is invoked once per request inside
+        ``build_connector_meta`` (Step 4) with the request's plan and
+        per-chunk new positions; its sorted output flows to the worker
+        as ``PersonalContextReqMeta.selected_positions`` and is
+        consumed by Step 7's sparse-Q override (not yet wired).
+        """
+        self._selector = selector
 
     def bind_storage(self, storage: InMemoryStorage) -> None:
         """Attach a pre-built storage backend.
@@ -415,12 +445,45 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
             block_cursor = end
             pos_cursor += len(chunk.token_ids)
 
+        new_pos_starts_tup = tuple(new_pos_starts)
+        selected_positions = self._invoke_selector(
+            pending.plan, new_pos_starts_tup
+        )
+
         return PersonalContextReqMeta(
             request_id=new_req.req_id,
             plan=pending.plan,
             block_assignments=tuple(block_assignments),
-            new_pos_starts=tuple(new_pos_starts),
+            new_pos_starts=new_pos_starts_tup,
+            selected_positions=selected_positions,
         )
+
+    def _invoke_selector(
+        self,
+        plan: ReusePlan,
+        new_pos_starts: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        """Run the bound selector; sort + dedupe + return ``()`` on error.
+
+        A selector raising or returning a non-tuple/list is treated as
+        "selector misbehaved" — we fall back to strategy-B (no
+        recomputation) rather than letting the exception escape into
+        the scheduler. The selector's contract says positions must be
+        sorted and in-range; we sort/dedupe defensively here but do not
+        clamp out-of-range (that surfaces as a downstream Q-shape
+        mismatch, which is the right failure mode).
+        """
+        if self._selector is None:
+            return ()
+        try:
+            raw = self._selector.select(plan, new_pos_starts)
+        except Exception:  # noqa: BLE001 — selector is user-pluggable
+            logger.exception(
+                "Selector %s raised; falling back to no selection.",
+                type(self._selector).__name__,
+            )
+            return ()
+        return tuple(sorted(set(raw)))
 
     # ----------------- Worker-side: Step 6-9 stubs -----------------
 

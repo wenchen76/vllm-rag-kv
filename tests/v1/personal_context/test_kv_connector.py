@@ -22,7 +22,9 @@ from vllm.v1.personal_context import (
     Chunk,
     InMemoryStorage,
     KVBlock,
+    NoSelection,
     ReusePlan,
+    SelectFirstR,
     StoreConfig,
     apply_rope_at_positions,
 )
@@ -757,6 +759,147 @@ def test_build_meta_is_idempotent_when_empty():
     a = c.build_connector_meta(_scheduler_output(new_reqs=[]))
     b = c.build_connector_meta(_scheduler_output(new_reqs=[]))
     assert a.requests == () and b.requests == ()
+
+
+# ----------------------- selection (Step 6.1 / 6.2) -----------------------
+
+
+def _drive_build_meta(
+    connector: PersonalContextKVConnector,
+    chunks: list[Chunk],
+) -> PersonalContextReqMeta:
+    """Helper: push a pending load and call build_connector_meta, returning
+    the single PersonalContextReqMeta produced. Used to exercise selector
+    integration without re-deriving block_assignments by hand."""
+    plan_dict = _plan_dict(chunks)
+    req = _request(plan_dict, request_id="sel-test")
+    total = sum(len(c.token_ids) for c in chunks)
+    connector.update_state_after_alloc(
+        req, blocks=None, num_external_tokens=total
+    )
+    num_blocks = sum(len(c.token_ids) // BLOCK_SIZE for c in chunks)
+    new_req = _new_req(
+        req_id="sel-test",
+        block_ids=list(range(100, 100 + num_blocks)),
+        num_computed_tokens=total,
+    )
+    out = connector.build_connector_meta(
+        _scheduler_output(new_reqs=[new_req])
+    )
+    assert len(out.requests) == 1
+    return out.requests[0]
+
+
+def test_selected_positions_defaults_to_empty_without_selector():
+    """Backwards compat: existing behaviour (strategy B) gives empty selection."""
+    c = _connector()
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE * 2)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=60)
+    rm = _drive_build_meta(c, [chunk])
+    assert rm.selected_positions == ()
+
+
+def test_noselection_keeps_selected_positions_empty():
+    c = _connector()
+    c.bind_selector(NoSelection())
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE * 2)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=61)
+    rm = _drive_build_meta(c, [chunk])
+    assert rm.selected_positions == ()
+
+
+def test_select_first_r_populates_selected_positions():
+    c = _connector()
+    c.bind_selector(SelectFirstR(0.5))
+    # L=8, ceil(0.5 * 8) = 4 positions; chunk at new_pos_start=0
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE * 2)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=62)
+    rm = _drive_build_meta(c, [chunk])
+    assert rm.selected_positions == (0, 1, 2, 3)
+
+
+def test_select_first_r_multi_chunk_concatenates():
+    c = _connector()
+    c.bind_selector(SelectFirstR(0.5))
+    chunk_a = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    chunk_b = Chunk(
+        token_ids=tuple(range(50, 50 + BLOCK_SIZE * 2)),
+        old_pos_start=BLOCK_SIZE,
+    )
+    _store_chunk(c._storage, chunk_a, seed=63)
+    _store_chunk(c._storage, chunk_b, seed=64)
+    rm = _drive_build_meta(c, [chunk_a, chunk_b])
+    # Chunk A: L=4, ceil(2)=2 positions [0, 1]
+    # Chunk B: L=8, ceil(4)=4 positions starting at new_pos_start=4 → [4, 5, 6, 7]
+    assert rm.selected_positions == (0, 1, 4, 5, 6, 7)
+
+
+def test_bind_selector_none_reverts_to_no_selection():
+    c = _connector()
+    c.bind_selector(SelectFirstR(0.5))
+    c.bind_selector(None)
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE * 2)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=65)
+    rm = _drive_build_meta(c, [chunk])
+    assert rm.selected_positions == ()
+
+
+def test_selector_output_is_sorted_and_deduped():
+    """The connector defensively sorts + dedupes the selector's output."""
+
+    class _UnsortedDupSelector:
+        def select(self, plan, new_pos_starts):
+            return (5, 1, 5, 3, 1, 2)
+
+    c = _connector()
+    c.bind_selector(_UnsortedDupSelector())
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE * 2)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=66)
+    rm = _drive_build_meta(c, [chunk])
+    assert rm.selected_positions == (1, 2, 3, 5)
+
+
+def test_misbehaving_selector_falls_back_to_empty():
+    """A selector raising should not break build_connector_meta."""
+
+    class _BrokenSelector:
+        def select(self, plan, new_pos_starts):
+            raise RuntimeError("boom")
+
+    c = _connector()
+    c.bind_selector(_BrokenSelector())
+    chunk = Chunk(token_ids=tuple(range(BLOCK_SIZE * 2)), old_pos_start=0)
+    _store_chunk(c._storage, chunk, seed=67)
+    rm = _drive_build_meta(c, [chunk])
+    # Connector falls back to strategy B and ships the meta with empty
+    # selection rather than dropping the load entirely.
+    assert rm.selected_positions == ()
+
+
+def test_selector_receives_plan_and_new_pos_starts():
+    """Spy selector confirms connector passes plan + new_pos_starts correctly."""
+    captured: dict = {}
+
+    class _SpySelector:
+        def select(self, plan, new_pos_starts):
+            captured["plan_chunks"] = plan.chunks
+            captured["new_pos_starts"] = tuple(new_pos_starts)
+            return ()
+
+    c = _connector()
+    c.bind_selector(_SpySelector())
+    chunk_a = Chunk(token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=0)
+    chunk_b = Chunk(
+        token_ids=tuple(range(BLOCK_SIZE)), old_pos_start=BLOCK_SIZE,
+    )
+    _store_chunk(c._storage, chunk_a, seed=68)
+    _store_chunk(c._storage, chunk_b, seed=69)
+    _drive_build_meta(c, [chunk_a, chunk_b])
+
+    assert captured["plan_chunks"] == (chunk_a, chunk_b)
+    # new_pos_starts are derived from local_prefix (=0 here) + cumulative
+    # chunk lengths.
+    assert captured["new_pos_starts"] == (0, BLOCK_SIZE)
 
 
 # ----------------------- start_load_kv (Step 5) -----------------------

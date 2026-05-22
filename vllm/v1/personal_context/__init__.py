@@ -41,6 +41,11 @@ from vllm.v1.personal_context.scatter import (
     scatter_loaded_block,
     scatter_loaded_plan,
 )
+from vllm.v1.personal_context.selection import (
+    NoSelection,
+    SelectFirstR,
+    Selector,
+)
 from vllm.v1.personal_context.storage import InMemoryStorage
 
 __all__ = [
@@ -53,11 +58,14 @@ __all__ = [
     "LoadedBlock",
     "LoadedChunk",
     "LoadedPlan",
+    "NoSelection",
     "PersonalContextConnector",
     "PlanLookup",
     "PrefillSetupSpec",
     "PrefixCachePollutionError",
     "ReusePlan",
+    "SelectFirstR",
+    "Selector",
     "StoreConfig",
     "apply_delta_rope",
     "apply_rope_at_positions",
