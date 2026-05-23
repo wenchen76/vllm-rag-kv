@@ -31,6 +31,7 @@ under an alias to keep the public class name unambiguous.
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -291,6 +292,14 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
 
         Defensive checks run regardless:
 
+            - **Placement validation**: chunk token IDs must match the
+              prompt slice at ``[num_computed_tokens, ... + total)``.
+              If not (most commonly because an assumed prefix such as a
+              system prompt is not actually prefix-cached, so the chunk
+              would land at the wrong position), → return 0. Must
+              happen here (before scheduler's ``allocate_slots`` commits
+              ``num_computed_tokens``) because no later hook can undo
+              the allocation.
             - ``AlignmentError`` from ``Chunk.block_hashes()`` → return 0
             - any store miss (eviction race / out-of-sync backend) →
               return 0. Selective recompute is Phase 9 work; until then
@@ -313,6 +322,49 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
         if plan is None or not plan.chunks:
             return 0, False
         total = sum(len(c.token_ids) for c in plan.chunks)
+
+        # Placement validation: PC's chunk scatter writes K/V to paged
+        # cache slots at positions ``[num_computed_tokens, ... + total)``
+        # under the assumption that the chunk token IDs match the prompt
+        # at that offset. The scheduler reaches that assumption by
+        # treating ``num_computed_tokens`` (local prefix-cache hits) as
+        # the immediate prefix to PC's external coverage. When that
+        # assumption fails — most commonly because the assumed prefix
+        # (e.g., a system prompt) is not actually prefix-cached — the
+        # scheduler would skip prefill for tokens whose K/V we never
+        # write, producing silent garbage.
+        #
+        # Bail out early so this connector returns 0 matched tokens and
+        # the request falls back to a vanilla full prefill. This must
+        # happen here (before ``allocate_slots`` is called in the
+        # scheduler) because later hooks cannot undo the allocation.
+        prompt_token_ids = request.prompt_token_ids
+        end = num_computed_tokens + total
+        if prompt_token_ids is None or end > len(prompt_token_ids):
+            logger.warning(
+                "Request %s: PC reuse plan overflows prompt "
+                "(local_prefix=%d + chunks=%d > prompt_len=%s); "
+                "falling back to full prefill.",
+                request.request_id,
+                num_computed_tokens,
+                total,
+                len(prompt_token_ids) if prompt_token_ids is not None else None,
+            )
+            return 0, False
+        expected_tokens = list(
+            itertools.chain.from_iterable(c.token_ids for c in plan.chunks)
+        )
+        actual_tokens = list(prompt_token_ids[num_computed_tokens:end])
+        if actual_tokens != expected_tokens:
+            logger.warning(
+                "Request %s: chunk tokens do not match prompt at offset "
+                "%d (likely prefix-cache miss on the assumed prefix); "
+                "falling back to full prefill.",
+                request.request_id,
+                num_computed_tokens,
+            )
+            return 0, False
+
         try:
             result = self._lookup.lookup(plan)
         except AlignmentError as e:
