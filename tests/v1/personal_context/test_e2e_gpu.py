@@ -130,16 +130,23 @@ def _make_storage_with_random_chunk_kv():
 
 
 @contextmanager
-def _pc_test_bind(storage, selector):
-    """Pickle ``storage`` + ``selector`` to a temp path and set
+def _pc_test_bind_storage(storage):
+    """Pickle ``storage`` to a temp path and set
     ``VLLM_PERSONAL_CONTEXT_TEST_BIND`` so the connector instances —
     both scheduler-side in this process and worker-side in vLLM's
-    spawned worker — auto-bind on ``__init__``."""
+    spawned worker — auto-bind storage on ``__init__``.
+
+    Selector is no longer carried here; it is resolved from
+    ``KVTransferConfig.kv_connector_extra_config`` so the test
+    exercises the production path. Storage still has to ride the
+    pickle channel because pre-populated ``InMemoryStorage`` instances
+    are not config-serialisable.
+    """
     fd, path = tempfile.mkstemp(suffix=".pkl", prefix="pc_test_")
     os.close(fd)
     try:
         with open(path, "wb") as f:
-            pickle.dump({"storage": storage, "selector": selector}, f)
+            pickle.dump({"storage": storage}, f)
         prev = os.environ.get("VLLM_PERSONAL_CONTEXT_TEST_BIND")
         os.environ["VLLM_PERSONAL_CONTEXT_TEST_BIND"] = path
         try:
@@ -218,16 +225,28 @@ def _run_vanilla(prompt_ids):
         torch.cuda.empty_cache()
 
 
-def _run_pc(prompt_ids, chunk, storage, selector):
-    """PC generation: bind storage + selector via env var, then run."""
+def _run_pc(prompt_ids, chunk, storage, selector_config):
+    """PC generation.
+
+    ``storage`` rides the pickle bind channel (test-only).
+    ``selector_config`` is fed into ``kv_connector_extra_config`` so
+    the connector resolves it on ``__init__`` via the production path.
+    ``None`` keeps strategy-B (no recompute); a dict or string follows
+    ``PersonalContextKVConnector._resolve_selector_from_config``.
+    """
     from vllm import LLM
     from vllm.config import KVTransferConfig
+
+    extra = {}
+    if selector_config is not None:
+        extra["selector"] = selector_config
 
     kv_transfer_config = KVTransferConfig(
         kv_connector="PersonalContextKVConnector",
         kv_role="kv_both",
+        kv_connector_extra_config=extra,
     )
-    with _pc_test_bind(storage, selector):
+    with _pc_test_bind_storage(storage):
         llm = LLM(
             model=MODEL,
             dtype="float16",
@@ -260,11 +279,9 @@ def test_pc_no_selection_diverges_from_vanilla():
     reads zeros instead of our scatter). Use it as a sanity check, not
     a correctness proof.
     """
-    from vllm.v1.personal_context import NoSelection
-
     out_vanilla = _run_vanilla(PROMPT_TOKEN_IDS)
     storage, chunk = _make_storage_with_random_chunk_kv()
-    out_pc = _run_pc(PROMPT_TOKEN_IDS, chunk, storage, NoSelection())
+    out_pc = _run_pc(PROMPT_TOKEN_IDS, chunk, storage, "NoSelection")
 
     assert out_pc != out_vanilla, (
         f"Expected divergence from vanilla under random scattered K/V "
@@ -288,11 +305,14 @@ def test_pc_full_selection_matches_vanilla():
     ``num_scheduled_tokens`` plumbing, or RoPE indexing on selected
     positions.
     """
-    from vllm.v1.personal_context import SelectFirstR
-
     out_vanilla = _run_vanilla(PROMPT_TOKEN_IDS)
     storage, chunk = _make_storage_with_random_chunk_kv()
-    out_pc = _run_pc(PROMPT_TOKEN_IDS, chunk, storage, SelectFirstR(1.0))
+    out_pc = _run_pc(
+        PROMPT_TOKEN_IDS,
+        chunk,
+        storage,
+        {"type": "SelectFirstR", "r": 1.0},
+    )
 
     assert out_pc == out_vanilla, (
         "PC + SelectFirstR(1.0) should reproduce vanilla output via "

@@ -50,7 +50,7 @@ from vllm.v1.personal_context.connector import (
 from vllm.v1.personal_context.load import load_plan
 from vllm.v1.personal_context.policy import ReusePlan
 from vllm.v1.personal_context.scatter import scatter_loaded_plan
-from vllm.v1.personal_context.selection import Selector
+from vllm.v1.personal_context.selection import SelectFirstR, Selector
 from vllm.v1.personal_context.storage import InMemoryStorage
 
 if TYPE_CHECKING:
@@ -192,16 +192,81 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
         # Step 6.1 stale-KV selection. ``None`` keeps strategy-B
         # behaviour (no recomputation, ``selected_positions`` always
         # empty). Install via ``bind_selector``.
-        self._selector: Selector | None = None
-        # Test-only escape hatch: when ``VLLM_PERSONAL_CONTEXT_TEST_BIND``
-        # is set, load a pickle containing ``{"storage": ..., "selector": ...}``
-        # and bind both sides. Needed for GPU e2e tests where the worker
-        # process is spawned separately from the test process and cannot
-        # be reached via direct ``bind_storage`` / ``bind_selector`` calls.
-        # The env var is inherited by ``multiprocessing.spawn``-launched
-        # workers, so both scheduler-side and worker-side connector
-        # instances see the same pickle.
+        #
+        # Resolution order (later overrides earlier):
+        #   1. ``None`` default (strategy-B).
+        #   2. ``kv_connector_extra_config.selector`` from the engine
+        #      config — production path. Frozen at engine startup.
+        #   3. ``VLLM_PERSONAL_CONTEXT_TEST_BIND`` pickle — test path.
+        #      Wins so GPU e2e tests can plug in arbitrary selectors
+        #      without touching engine config.
+        self._selector: Selector | None = self._resolve_selector_from_config()
         self._maybe_auto_bind_from_env()
+
+    def _resolve_selector_from_config(self) -> Selector | None:
+        """Build a ``Selector`` from ``kv_connector_extra_config``.
+
+        Recognised ``selector`` shapes in ``kv_connector_extra_config``:
+
+            { "selector": null }                       → ``None`` (strategy-B)
+            { "selector": "NoSelection" }              → ``None``
+            { "selector": "SelectFirstR" }             → ``SelectFirstR(r=1.0)``
+            { "selector": {"type": "SelectFirstR",
+                           "r": 0.5} }                 → ``SelectFirstR(r=0.5)``
+
+        Unknown types or malformed entries log a warning and fall back
+        to ``None`` so a typo in config does not crash the engine — the
+        request just runs as strategy-B.
+
+        Frozen at engine startup; per-request selection control is out
+        of scope and deferred to a later phase if needed.
+        """
+        extra = self._kv_transfer_config.kv_connector_extra_config or {}
+        spec = extra.get("selector")
+        if spec is None:
+            return None
+
+        if isinstance(spec, str):
+            name = spec
+            params: dict[str, Any] = {}
+        elif isinstance(spec, dict):
+            name = spec.get("type", "")
+            params = {k: v for k, v in spec.items() if k != "type"}
+        else:
+            logger.warning(
+                "PersonalContextKVConnector: kv_connector_extra_config."
+                "selector must be a string or dict, got %s; ignoring.",
+                type(spec).__name__,
+            )
+            return None
+
+        normalised = name.strip().lower()
+        if normalised in ("", "none", "noselection"):
+            return None
+        if normalised in ("first_r", "selectfirstr"):
+            try:
+                r = float(params.get("r", 1.0))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "PersonalContextKVConnector: SelectFirstR.r must be a "
+                    "float in [0.0, 1.0], got %r; ignoring selector config.",
+                    params.get("r"),
+                )
+                return None
+            try:
+                return SelectFirstR(r=r)
+            except ValueError as e:
+                logger.warning(
+                    "PersonalContextKVConnector: %s; ignoring selector config.",
+                    e,
+                )
+                return None
+        logger.warning(
+            "PersonalContextKVConnector: unknown selector type %r; "
+            "ignoring (request runs as strategy-B).",
+            name,
+        )
+        return None
 
     def _maybe_auto_bind_from_env(self) -> None:
         """If ``VLLM_PERSONAL_CONTEXT_TEST_BIND`` is set, load the pickle

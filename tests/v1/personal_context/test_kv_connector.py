@@ -39,11 +39,14 @@ HEAD_DIM = 8
 # ----------------------- fixtures / helpers -----------------------
 
 
-def _fake_vllm_config(block_size: int = BLOCK_SIZE):
+def _fake_vllm_config(
+    block_size: int = BLOCK_SIZE,
+    kv_connector_extra_config: dict | None = None,
+):
     return SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
             kv_connector="PersonalContextKVConnector",
-            extra_config={},
+            kv_connector_extra_config=kv_connector_extra_config or {},
         ),
         cache_config=SimpleNamespace(block_size=block_size),
     )
@@ -1196,3 +1199,91 @@ def test_rope_theta_threads_through_load_plan():
     # V identical (position-independent).
     assert not torch.allclose(kvs_custom[0][1, 0], kvs_default[0][1, 0])
     torch.testing.assert_close(kvs_custom[0][1, 1], kvs_default[0][1, 1])
+
+
+# ----------------------- selector resolved from config -----------------------
+
+
+def _connector_with_extra(extra: dict) -> PersonalContextKVConnector:
+    return PersonalContextKVConnector(
+        _fake_vllm_config(kv_connector_extra_config=extra),
+        KVConnectorRole.SCHEDULER,
+        _fake_kv_cache_config(),
+    )
+
+
+def test_resolve_selector_default_none():
+    c = _connector_with_extra({})
+    assert c._selector is None
+
+
+def test_resolve_selector_explicit_none_string():
+    c = _connector_with_extra({"selector": "NoSelection"})
+    assert c._selector is None
+
+
+def test_resolve_selector_first_r_shorthand_defaults_to_one():
+    c = _connector_with_extra({"selector": "SelectFirstR"})
+    assert isinstance(c._selector, SelectFirstR)
+    assert c._selector.r == 1.0
+
+
+def test_resolve_selector_first_r_with_dict_params():
+    c = _connector_with_extra({"selector": {"type": "SelectFirstR", "r": 0.5}})
+    assert isinstance(c._selector, SelectFirstR)
+    assert c._selector.r == 0.5
+
+
+def test_resolve_selector_unknown_type_falls_back_to_none():
+    c = _connector_with_extra({"selector": "DefinitelyNotAType"})
+    assert c._selector is None
+
+
+def test_resolve_selector_malformed_r_falls_back_to_none():
+    c = _connector_with_extra(
+        {"selector": {"type": "SelectFirstR", "r": "not-a-number"}}
+    )
+    assert c._selector is None
+
+
+def test_resolve_selector_r_out_of_range_falls_back_to_none():
+    c = _connector_with_extra({"selector": {"type": "SelectFirstR", "r": 2.0}})
+    assert c._selector is None
+
+
+def test_resolve_selector_non_string_non_dict_falls_back_to_none():
+    c = _connector_with_extra({"selector": 42})
+    assert c._selector is None
+
+
+def test_test_bind_overrides_config_selector():
+    """``VLLM_PERSONAL_CONTEXT_TEST_BIND`` takes priority over config.
+
+    Allows GPU e2e tests to inject arbitrary selectors without
+    touching the engine-level ``kv_connector_extra_config``.
+    """
+    import os
+    import pickle
+    import tempfile
+
+    fd, path = tempfile.mkstemp(suffix=".pkl", prefix="pc_test_")
+    os.close(fd)
+    try:
+        with open(path, "wb") as f:
+            pickle.dump({"selector": NoSelection()}, f)
+        os.environ["VLLM_PERSONAL_CONTEXT_TEST_BIND"] = path
+        try:
+            c = _connector_with_extra(
+                {"selector": {"type": "SelectFirstR", "r": 0.25}}
+            )
+            # Config would have given SelectFirstR(r=0.25); test bind
+            # overwrites with NoSelection (None per bind_selector
+            # semantics for the NoSelection instance is preserved as-is).
+            assert isinstance(c._selector, NoSelection)
+        finally:
+            os.environ.pop("VLLM_PERSONAL_CONTEXT_TEST_BIND", None)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
