@@ -71,8 +71,8 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from examples.personal_context.chunk_encoder_hf import (  # noqa: E402
-    QWEN_2_5_0_5B_INSTRUCT,
     HFChunkEncoder,
+    preset_for,
     store_config_for,
 )
 from vllm.v1.personal_context import InMemoryStorage  # noqa: E402
@@ -416,6 +416,16 @@ def main() -> None:
         help=f"Path to JSONL of instances (default: {DEFAULT_DATA_PATH}).",
     )
     parser.add_argument(
+        "--model",
+        type=str,
+        default="meta-llama/Meta-Llama-3-8B-Instruct",
+        help=(
+            "HF model id. Must have a matching ModelPreset registered "
+            "in chunk_encoder_hf.KNOWN_PRESETS. Gated models (Llama-3) "
+            "require ``huggingface-cli login`` first."
+        ),
+    )
+    parser.add_argument(
         "--top_k",
         type=int,
         default=4,
@@ -445,8 +455,13 @@ def main() -> None:
     parser.add_argument(
         "--gpu_memory_utilization",
         type=float,
-        default=0.6,
-        help="vLLM gpu_memory_utilization.",
+        default=0.85,
+        help=(
+            "vLLM gpu_memory_utilization (fraction of TOTAL VRAM, "
+            "including model weights). Default 0.85 fits an 8B fp16 "
+            "model + KV cache on a 24GB GPU. For smaller models you "
+            "can drop to 0.6 to leave room for other GPU users."
+        ),
     )
     args = parser.parse_args()
 
@@ -456,7 +471,12 @@ def main() -> None:
     print(f"[demo] loaded {len(instances)} instances from {args.data}")
 
     # 2. Build index (encoder + embedder + FAISS + PC store).
-    preset = QWEN_2_5_0_5B_INSTRUCT
+    preset = preset_for(args.model)
+    print(
+        f"[demo] target model = {preset.hf_id}  "
+        f"({preset.num_layers} layers, {preset.num_kv_heads} KV heads, "
+        f"head_dim={preset.head_dim}, rope_theta={preset.rope_theta})"
+    )
     index = RAGIndex(
         preset=preset,
         embedder_model_id=args.embedder,

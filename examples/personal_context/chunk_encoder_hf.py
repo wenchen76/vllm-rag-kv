@@ -100,6 +100,39 @@ LLAMA_3_8B_INSTRUCT = ModelPreset(
 # the scaling correction in ``vllm/v1/personal_context/rope.py``.
 
 
+# Registry of presets keyed by HF id. Demo / CLI tools look up by id
+# rather than passing the dataclass directly so a single ``--model``
+# string flag works end-to-end.
+KNOWN_PRESETS: dict[str, ModelPreset] = {
+    p.hf_id: p
+    for p in (
+        QWEN_2_5_0_5B_INSTRUCT,
+        QWEN_2_5_1_5B_INSTRUCT,
+        LLAMA_3_8B_INSTRUCT,
+    )
+}
+
+
+def preset_for(hf_id: str) -> ModelPreset:
+    """Look up a ``ModelPreset`` by its HF id.
+
+    Raises ``KeyError`` with a helpful list of registered ids when the
+    requested model has no preset — register a new ``ModelPreset`` in
+    this file rather than removing this guard, so the constructor's
+    architecture-vs-preset cross-checks still run.
+    """
+    try:
+        return KNOWN_PRESETS[hf_id]
+    except KeyError as e:
+        known = "\n  ".join(sorted(KNOWN_PRESETS.keys()))
+        raise KeyError(
+            f"No ModelPreset registered for {hf_id!r}.\n"
+            f"Known presets:\n  {known}\n"
+            f"To add a new one, declare a ModelPreset in "
+            f"chunk_encoder_hf.py and append it to KNOWN_PRESETS."
+        ) from e
+
+
 def store_config_for(preset: ModelPreset, block_size: int = 16) -> StoreConfig:
     return StoreConfig(
         model_id=preset.hf_id,

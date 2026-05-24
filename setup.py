@@ -1123,6 +1123,14 @@ setup(
             "opentelemetry-exporter-otlp>=1.26.0",
             "opentelemetry-semantic-conventions-ai>=0.4.1",
         ],
+        # Personal-context RAG examples — offline chunk encoding via
+        # HF transformers (already a core dep) + FAISS for vector
+        # search + sentence-transformers for embeddings. Install with:
+        #   uv pip install -e ".[personal-context]"
+        "personal-context": [
+            "faiss-cpu>=1.8.0",
+            "sentence-transformers>=3.0.0",
+        ],
     },
     cmdclass=cmdclass,
     package_data=package_data,
