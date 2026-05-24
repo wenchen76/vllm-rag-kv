@@ -71,7 +71,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from examples.personal_context.chunk_encoder_hf import (  # noqa: E402
-    LLAMA_3_2_1B_INSTRUCT,
+    QWEN_2_5_0_5B_INSTRUCT,
     HFChunkEncoder,
     store_config_for,
 )
@@ -456,7 +456,7 @@ def main() -> None:
     print(f"[demo] loaded {len(instances)} instances from {args.data}")
 
     # 2. Build index (encoder + embedder + FAISS + PC store).
-    preset = LLAMA_3_2_1B_INSTRUCT
+    preset = QWEN_2_5_0_5B_INSTRUCT
     index = RAGIndex(
         preset=preset,
         embedder_model_id=args.embedder,

@@ -67,12 +67,20 @@ class ModelPreset:
     rope_theta: float
 
 
-LLAMA_3_2_1B_INSTRUCT = ModelPreset(
-    hf_id="meta-llama/Llama-3.2-1B-Instruct",
-    num_layers=16,
-    num_kv_heads=8,
+QWEN_2_5_0_5B_INSTRUCT = ModelPreset(
+    hf_id="Qwen/Qwen2.5-0.5B-Instruct",
+    num_layers=24,
+    num_kv_heads=2,  # GQA: 14 attn heads ÷ 7
     head_dim=64,
-    rope_theta=500000.0,
+    rope_theta=1000000.0,
+)
+
+QWEN_2_5_1_5B_INSTRUCT = ModelPreset(
+    hf_id="Qwen/Qwen2.5-1.5B-Instruct",
+    num_layers=28,
+    num_kv_heads=2,  # GQA: 12 attn heads ÷ 6
+    head_dim=128,
+    rope_theta=1000000.0,
 )
 
 LLAMA_3_8B_INSTRUCT = ModelPreset(
@@ -82,6 +90,14 @@ LLAMA_3_8B_INSTRUCT = ModelPreset(
     head_dim=128,
     rope_theta=500000.0,
 )
+
+# NOTE: Meta-Llama-3.1 / 3.2 series are intentionally NOT listed here.
+# They ship with ``rope_scaling = {"rope_type": "llama3", ...}`` to
+# extend context to 128K via NTK-style piecewise frequency rescaling.
+# PC's ``apply_delta_rope`` only implements standard RoPE; using a
+# scaled-RoPE model would silently mis-rotate K on delta != 0 and
+# corrupt attention. Re-add those presets only after implementing
+# the scaling correction in ``vllm/v1/personal_context/rope.py``.
 
 
 def store_config_for(preset: ModelPreset, block_size: int = 16) -> StoreConfig:
@@ -146,21 +162,23 @@ class HFChunkEncoder:
             f"preset says head_dim={preset.head_dim}, HF reports "
             f"{expected_head_dim}"
         )
-        assert float(hf_cfg.rope_theta) == preset.rope_theta, (
+        hf_rope_theta = _read_rope_theta(hf_cfg)
+        assert hf_rope_theta == preset.rope_theta, (
             f"preset says rope_theta={preset.rope_theta}, HF reports "
-            f"{hf_cfg.rope_theta}"
+            f"{hf_rope_theta}"
         )
-        # Loud refusal for Llama-3.1's NTK rope_scaling — PC's
-        # apply_delta_rope does not implement that yet, so delta-RoPE
-        # rotation would silently mis-rotate. Plain Llama-3 / Llama-3.2
-        # have rope_scaling=None.
+        # Loud refusal for any NTK / piecewise rope_scaling — PC's
+        # apply_delta_rope only implements standard RoPE, so delta-RoPE
+        # rotation would silently mis-rotate. Llama-3 / Qwen2.5 with
+        # no scaling are safe; Llama-3.1 / 3.2 (rope_type="llama3")
+        # are NOT and trip this assertion.
         if getattr(hf_cfg, "rope_scaling", None) is not None:
             raise NotImplementedError(
                 f"Model {preset.hf_id} declares rope_scaling="
                 f"{hf_cfg.rope_scaling}. PC's apply_delta_rope only "
                 "supports standard RoPE; using this model would produce "
                 "wrong K rotation on reuse. Pick a no-scaling variant "
-                "(Llama-3, Llama-3.2, Qwen2.5)."
+                "(Llama-3, Qwen2.5, TinyLlama)."
             )
 
     def encode_chunk(
@@ -314,6 +332,29 @@ def _extract_past_kv_layers(past_kv) -> list[tuple[torch.Tensor, torch.Tensor]]:
     return [(k, v) for k, v in past_kv]
 
 
+def _read_rope_theta(hf_cfg) -> float:
+    """Read ``rope_theta`` from a HF config across transformers versions.
+
+    transformers used to expose ``rope_theta`` as a direct attribute on
+    every model config that uses RoPE. ~4.50 consolidated RoPE settings
+    into a ``rope_parameters`` dict on some configs; other variants nest
+    it inside ``rope_scaling``. This helper checks all three layouts and
+    returns the first hit.
+    """
+    val = getattr(hf_cfg, "rope_theta", None)
+    if val is not None:
+        return float(val)
+    for attr in ("rope_parameters", "rope_scaling"):
+        nested = getattr(hf_cfg, attr, None) or {}
+        if isinstance(nested, dict) and "rope_theta" in nested:
+            return float(nested["rope_theta"])
+    raise AttributeError(
+        f"could not find rope_theta on {type(hf_cfg).__name__}; "
+        f"checked .rope_theta, .rope_parameters.rope_theta, "
+        f".rope_scaling.rope_theta"
+    )
+
+
 def _check_kv_shape(
     t: torch.Tensor,
     layer_idx: int,
@@ -346,7 +387,7 @@ def populate_storage(
 
 def _demo() -> None:
     """Encode one short chunk and verify it round-trips through storage."""
-    preset = LLAMA_3_2_1B_INSTRUCT
+    preset = QWEN_2_5_0_5B_INSTRUCT
     block_size = 16
     cfg = store_config_for(preset, block_size=block_size)
 
