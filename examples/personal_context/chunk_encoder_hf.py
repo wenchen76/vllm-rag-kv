@@ -167,18 +167,28 @@ class HFChunkEncoder:
             f"preset says rope_theta={preset.rope_theta}, HF reports "
             f"{hf_rope_theta}"
         )
-        # Loud refusal for any NTK / piecewise rope_scaling — PC's
-        # apply_delta_rope only implements standard RoPE, so delta-RoPE
-        # rotation would silently mis-rotate. Llama-3 / Qwen2.5 with
-        # no scaling are safe; Llama-3.1 / 3.2 (rope_type="llama3")
-        # are NOT and trip this assertion.
-        if getattr(hf_cfg, "rope_scaling", None) is not None:
+        # Loud refusal for any non-default rope_type — PC's
+        # apply_delta_rope only implements standard RoPE, so any
+        # scaled variant (NTK piecewise, linear interpolation, YaRN,
+        # dynamic NTK) would silently mis-rotate K on reuse.
+        #
+        # Newer transformers (~4.50+) ALWAYS populates rope_scaling
+        # even for standard-RoPE models, with ``rope_type="default"``
+        # as the "no actual scaling" sentinel. Old transformers leaves
+        # rope_scaling=None for the same case. Both shapes are safe.
+        rope_scaling = getattr(hf_cfg, "rope_scaling", None)
+        rope_type = (
+            rope_scaling.get("rope_type")
+            if isinstance(rope_scaling, dict)
+            else None
+        )
+        if rope_type not in (None, "default"):
             raise NotImplementedError(
-                f"Model {preset.hf_id} declares rope_scaling="
-                f"{hf_cfg.rope_scaling}. PC's apply_delta_rope only "
-                "supports standard RoPE; using this model would produce "
-                "wrong K rotation on reuse. Pick a no-scaling variant "
-                "(Llama-3, Qwen2.5, TinyLlama)."
+                f"Model {preset.hf_id} uses rope_type={rope_type!r} "
+                f"(scaling={rope_scaling}). PC's apply_delta_rope only "
+                "supports standard RoPE (rope_type='default' or None); "
+                "any other scaling would silently mis-rotate K on reuse. "
+                "Pick a no-scaling variant (Llama-3, Qwen2.5, TinyLlama)."
             )
 
     def encode_chunk(
