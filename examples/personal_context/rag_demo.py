@@ -82,7 +82,7 @@ from examples.personal_context.chunk_encoder_hf import (  # noqa: E402
     preset_for,
     store_config_for,
 )
-from vllm.v1.personal_context import InMemoryStorage  # noqa: E402
+from vllm.v1.personal_context import Chunk, InMemoryStorage  # noqa: E402
 
 
 DEFAULT_DATA_PATH = Path(__file__).parent / "sample_data.jsonl"
@@ -188,11 +188,20 @@ class RAGIndex:
         self.block_size = block_size
         self.device = device
 
-        print(f"[index] loading HF encoder: {preset.hf_id}")
+        print(f"[index] preparing HF encoder (tokenizer-only init): {preset.hf_id}")
+        # Lazy model load — defer ~30s of HF model loading until the
+        # first cache miss. Tokenizer loads up-front (needed for cache
+        # hit checks even on full-warm runs).
         self.encoder = HFChunkEncoder(
-            preset=preset, device=device, dtype=torch.float16
+            preset=preset,
+            device=device,
+            dtype=torch.float16,
+            lazy_model=True,
         )
         self.tokenizer = self.encoder.tokenizer
+        # Cache hit/miss counters, reset per ingest_instances() call.
+        self._cache_hits: int = 0
+        self._cache_misses: int = 0
 
         print(f"[index] loading embedder: {embedder_model_id}")
         self.embedder = SentenceTransformer(embedder_model_id, device=device)
@@ -211,8 +220,17 @@ class RAGIndex:
     # ----- ingestion -----
 
     def ingest_instances(self, instances: list[dict]) -> None:
+        self._cache_hits = 0
+        self._cache_misses = 0
         for inst in instances:
             self._ingest_instance(inst)
+        total = self._cache_hits + self._cache_misses
+        if total > 0:
+            print(
+                f"[index] ingest summary: {self._cache_hits}/{total} chunks "
+                f"served from cache, {self._cache_misses} encoded fresh. "
+                f"HF model loaded: {self.encoder.is_model_loaded}"
+            )
 
     def _ingest_instance(self, instance: dict) -> None:
         instance_id = instance["id"]
@@ -250,7 +268,40 @@ class RAGIndex:
 
         global_id = f"{instance_id}__{chunk_name}"
 
-        # Encode → push every block into the PC store.
+        # Cache check (Phase 12.4): if every block hash for this chunk
+        # is already in the KV store, skip encoding entirely. With a
+        # warm Redis this avoids both the HF forward pass (~1s / chunk)
+        # AND the first cache-miss-triggered HF model load (~30s for
+        # Llama-3-8B). Cheap: ``__contains__`` is one EXISTS per block,
+        # ~0.1ms localhost.
+        cache_check_chunk = Chunk(token_ids=tuple(tokens), old_pos_start=0)
+        cache_check_hashes = list(
+            cache_check_chunk.block_hashes(self.block_size)
+        )
+        if all(h in self.kv_store for h in cache_check_hashes):
+            print(
+                f"[hit ] {instance_id}/{chunk_name}: "
+                f"{len(cache_check_hashes)} blocks already cached, "
+                f"skipping HF encode"
+            )
+            self._cache_hits += 1
+            self.entries.append(
+                IndexEntry(
+                    global_id=global_id,
+                    instance_id=instance_id,
+                    chunk_name=chunk_name,
+                    source=chunk_data.get("source", ""),
+                    gold_rank=int(chunk_data.get("retrieval_rank", 0)),
+                    text=text,
+                    token_ids=list(tokens),
+                    old_pos_start=0,
+                )
+            )
+            return
+
+        # Cache miss → encode (triggers HF model lazy load on the first
+        # miss) → push every block into the PC store.
+        self._cache_misses += 1
         _, block_entries = self.encoder.encode_chunk(
             tokens, old_pos_start=0, block_size=self.block_size
         )

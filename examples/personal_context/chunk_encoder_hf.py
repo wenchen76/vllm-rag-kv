@@ -159,9 +159,22 @@ class HFChunkEncoder:
         preset: ModelPreset,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
+        lazy_model: bool = False,
     ):
+        """
+        Args:
+            preset: Architecture / model id descriptor.
+            device: Where the model lives (``cuda`` / ``cpu``).
+            dtype: Model dtype; should match the StoreConfig.
+            lazy_model: If True, skip loading the model until the first
+                ``encode_chunk`` call (or explicit ``.model`` access).
+                The tokenizer always loads up-front since it's tiny and
+                callers usually need it for hash precomputation. Use
+                this when ingestion may hit a fully-warm cache and the
+                heavy model load can be avoided entirely.
+        """
         try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from transformers import AutoTokenizer
         except ImportError as e:
             raise ImportError(
                 "HFChunkEncoder requires `transformers`. "
@@ -171,33 +184,73 @@ class HFChunkEncoder:
         self.preset = preset
         self.device = device
         self.dtype = dtype
+        # Tokenizer is always loaded (small, ~10MB cached) — callers
+        # need it to compute block hashes for cache hit checks before
+        # deciding whether to pay the model load cost.
         self.tokenizer = AutoTokenizer.from_pretrained(preset.hf_id)
-        self.model = (
-            AutoModelForCausalLM.from_pretrained(preset.hf_id, dtype=dtype)
-            .to(device)
+        self._model = None
+        if not lazy_model:
+            self._ensure_model()
+
+    @property
+    def model(self):
+        """Accessing ``.model`` triggers lazy load if needed."""
+        if self._model is None:
+            self._ensure_model()
+        return self._model
+
+    @property
+    def is_model_loaded(self) -> bool:
+        """Whether the heavy HF model is actually in memory yet."""
+        return self._model is not None
+
+    def _ensure_model(self) -> None:
+        """Idempotent: load + arch-check the HF model on first call.
+
+        Architecture checks (layer count, head dim, rope_theta,
+        rope_type) intentionally live here rather than ``__init__``
+        because they all read ``self.model.config``. Lazy mode never
+        runs them until the model is actually needed.
+        """
+        if self._model is not None:
+            return
+        try:
+            from transformers import AutoModelForCausalLM
+        except ImportError as e:
+            raise ImportError(
+                "HFChunkEncoder requires `transformers`. "
+                "Install via `uv pip install transformers`."
+            ) from e
+
+        print(f"[encoder] loading model {self.preset.hf_id} (lazy)")
+        self._model = (
+            AutoModelForCausalLM.from_pretrained(
+                self.preset.hf_id, dtype=self.dtype
+            )
+            .to(self.device)
             .eval()
         )
 
-        # Cross-check the HF config matches the preset; catches the case
-        # where the preset is stale or the HF checkpoint published a
-        # variant with different num_kv_heads / head_dim.
-        hf_cfg = self.model.config
-        assert hf_cfg.num_hidden_layers == preset.num_layers, (
-            f"preset says {preset.num_layers} layers, HF reports "
+        # Cross-check the HF config matches the preset; catches the
+        # case where the preset is stale or the HF checkpoint
+        # published a variant with different num_kv_heads / head_dim.
+        hf_cfg = self._model.config
+        assert hf_cfg.num_hidden_layers == self.preset.num_layers, (
+            f"preset says {self.preset.num_layers} layers, HF reports "
             f"{hf_cfg.num_hidden_layers}"
         )
-        assert hf_cfg.num_key_value_heads == preset.num_kv_heads, (
-            f"preset says {preset.num_kv_heads} KV heads, HF reports "
+        assert hf_cfg.num_key_value_heads == self.preset.num_kv_heads, (
+            f"preset says {self.preset.num_kv_heads} KV heads, HF reports "
             f"{hf_cfg.num_key_value_heads}"
         )
         expected_head_dim = hf_cfg.hidden_size // hf_cfg.num_attention_heads
-        assert expected_head_dim == preset.head_dim, (
-            f"preset says head_dim={preset.head_dim}, HF reports "
+        assert expected_head_dim == self.preset.head_dim, (
+            f"preset says head_dim={self.preset.head_dim}, HF reports "
             f"{expected_head_dim}"
         )
         hf_rope_theta = _read_rope_theta(hf_cfg)
-        assert hf_rope_theta == preset.rope_theta, (
-            f"preset says rope_theta={preset.rope_theta}, HF reports "
+        assert hf_rope_theta == self.preset.rope_theta, (
+            f"preset says rope_theta={self.preset.rope_theta}, HF reports "
             f"{hf_rope_theta}"
         )
         # Loud refusal for any non-default rope_type — PC's
@@ -217,7 +270,7 @@ class HFChunkEncoder:
         )
         if rope_type not in (None, "default"):
             raise NotImplementedError(
-                f"Model {preset.hf_id} uses rope_type={rope_type!r} "
+                f"Model {self.preset.hf_id} uses rope_type={rope_type!r} "
                 f"(scaling={rope_scaling}). PC's apply_delta_rope only "
                 "supports standard RoPE (rope_type='default' or None); "
                 "any other scaling would silently mis-rotate K on reuse. "
