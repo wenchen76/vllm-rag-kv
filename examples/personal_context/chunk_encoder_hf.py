@@ -334,12 +334,55 @@ class HFChunkEncoder:
 def _extract_past_kv_layers(past_kv) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Normalise transformers' evolving past_kv API to a flat list.
 
-    Newer transformers returns ``DynamicCache`` with ``key_cache`` /
-    ``value_cache`` lists; older returns ``tuple[layer] of (K, V)``.
+    Tried in order:
+        1. Plain ``tuple[layer] of (K, V)`` — oldest format.
+        2. ``DynamicCache`` with ``.key_cache`` / ``.value_cache`` lists.
+        3. ``DynamicCache`` with ``.layers`` (each layer object has
+           ``.keys`` / ``.values`` or ``.key`` / ``.value``) — newest.
+        4. Iterable fall-through: each row's first two elements are K, V.
+
+    Returns ``[(K, V), ...]`` one per layer, in layer order.
     """
-    if hasattr(past_kv, "key_cache") and hasattr(past_kv, "value_cache"):
+    # 1. Plain tuple (old transformers)
+    if isinstance(past_kv, tuple) and past_kv and isinstance(
+        past_kv[0], tuple
+    ):
+        return [(k, v) for k, v in past_kv]
+
+    # 2. DynamicCache w/ key_cache / value_cache parallel lists
+    if (
+        hasattr(past_kv, "key_cache")
+        and hasattr(past_kv, "value_cache")
+        and len(past_kv.key_cache) > 0
+    ):
         return list(zip(past_kv.key_cache, past_kv.value_cache))
-    return [(k, v) for k, v in past_kv]
+
+    # 3. DynamicCache w/ .layers (transformers ~4.55+)
+    if hasattr(past_kv, "layers"):
+        out: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for layer in past_kv.layers:
+            if hasattr(layer, "keys") and hasattr(layer, "values"):
+                out.append((layer.keys, layer.values))
+            elif hasattr(layer, "key") and hasattr(layer, "value"):
+                out.append((layer.key, layer.value))
+            else:
+                raise RuntimeError(
+                    f"unknown DynamicCache layer type: "
+                    f"{type(layer).__name__}; attrs="
+                    f"{[a for a in dir(layer) if not a.startswith('_')]}"
+                )
+        if out:
+            return out
+
+    # 4. Iterable, just take first two of each row
+    try:
+        return [(row[0], row[1]) for row in past_kv]
+    except (TypeError, IndexError) as e:
+        raise RuntimeError(
+            f"could not extract per-layer K/V from past_kv of type "
+            f"{type(past_kv).__name__}; checked tuple, .key_cache/"
+            f".value_cache, .layers, iter"
+        ) from e
 
 
 def _read_rope_theta(hf_cfg) -> float:
