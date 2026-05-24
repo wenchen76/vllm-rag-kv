@@ -1130,6 +1130,10 @@ setup(
         "personal-context": [
             "faiss-cpu>=1.8.0",
             "sentence-transformers>=3.0.0",
+            "redis>=5.0.0",
+            # In-process Redis emulator for unit tests; tiny (~50KB).
+            # Drop if shrinking install size matters.
+            "fakeredis>=2.20.0",
         ],
     },
     cmdclass=cmdclass,

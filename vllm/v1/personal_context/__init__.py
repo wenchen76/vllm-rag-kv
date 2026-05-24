@@ -47,7 +47,8 @@ from vllm.v1.personal_context.selection import (
     SelectFirstR,
     Selector,
 )
-from vllm.v1.personal_context.storage import InMemoryStorage
+from vllm.v1.personal_context.redis_storage import RedisKVStorage
+from vllm.v1.personal_context.storage import InMemoryStorage, validate_block
 
 __all__ = [
     "AlignmentError",
@@ -64,6 +65,7 @@ __all__ = [
     "PlanLookup",
     "PrefillSetupSpec",
     "PrefixCachePollutionError",
+    "RedisKVStorage",
     "ReusePlan",
     "SelectFirstR",
     "Selector",
@@ -80,5 +82,6 @@ __all__ = [
     "scatter_loaded_block",
     "scatter_loaded_plan",
     "setup_chunk_aware_prefill",
+    "validate_block",
     "validate_chunk_alignment",
 ]

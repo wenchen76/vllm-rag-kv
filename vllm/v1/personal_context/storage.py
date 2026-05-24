@@ -27,6 +27,48 @@ from vllm.v1.personal_context.chunk import AlignmentError
 from vllm.v1.personal_context.entry import KVBlock, StoreConfig
 
 
+def validate_block(config: StoreConfig, block: KVBlock) -> None:
+    """Enforce KVBlock matches ``config`` (layer count, per-tensor shape,
+    dtype, ``old_pos_start`` alignment).
+
+    Module-level helper so every storage backend — in-memory, Redis,
+    future disk or remote — runs the same shape-side of the alignment
+    contract on ``put``. Raises on first failure; never returns False.
+    """
+    if len(block.keys) != config.num_layers:
+        raise ValueError(
+            f"KVBlock has {len(block.keys)} key tensors, "
+            f"expected {config.num_layers}"
+        )
+    if len(block.values) != config.num_layers:
+        raise ValueError(
+            f"KVBlock has {len(block.values)} value tensors, "
+            f"expected {config.num_layers}"
+        )
+    if block.old_pos_start < 0 or block.old_pos_start % config.block_size != 0:
+        raise AlignmentError(
+            f"KVBlock.old_pos_start {block.old_pos_start} is not a "
+            f"non-negative multiple of block_size {config.block_size}"
+        )
+    expected = (config.block_size, config.num_kv_heads, config.head_dim)
+    for layer_idx, (k, v) in enumerate(zip(block.keys, block.values)):
+        if tuple(k.shape) != expected:
+            raise ValueError(
+                f"KVBlock layer {layer_idx} K shape {tuple(k.shape)}, "
+                f"expected {expected}"
+            )
+        if tuple(v.shape) != expected:
+            raise ValueError(
+                f"KVBlock layer {layer_idx} V shape {tuple(v.shape)}, "
+                f"expected {expected}"
+            )
+        if k.dtype != config.dtype or v.dtype != config.dtype:
+            raise ValueError(
+                f"KVBlock layer {layer_idx} dtype K={k.dtype} V={v.dtype}, "
+                f"expected {config.dtype}"
+            )
+
+
 class InMemoryStorage:
     def __init__(self, config: StoreConfig):
         self._config = config
@@ -37,7 +79,7 @@ class InMemoryStorage:
         return self._config
 
     def put(self, key: bytes, block: KVBlock) -> None:
-        self._validate(block)
+        validate_block(self._config, block)
         self._blocks[key] = block
 
     def get(self, key: bytes) -> Optional[KVBlock]:
@@ -52,38 +94,3 @@ class InMemoryStorage:
 
     def __len__(self) -> int:
         return len(self._blocks)
-
-    def _validate(self, block: KVBlock) -> None:
-        cfg = self._config
-        if len(block.keys) != cfg.num_layers:
-            raise ValueError(
-                f"KVBlock has {len(block.keys)} key tensors, "
-                f"expected {cfg.num_layers}"
-            )
-        if len(block.values) != cfg.num_layers:
-            raise ValueError(
-                f"KVBlock has {len(block.values)} value tensors, "
-                f"expected {cfg.num_layers}"
-            )
-        if block.old_pos_start < 0 or block.old_pos_start % cfg.block_size != 0:
-            raise AlignmentError(
-                f"KVBlock.old_pos_start {block.old_pos_start} is not a "
-                f"non-negative multiple of block_size {cfg.block_size}"
-            )
-        expected = (cfg.block_size, cfg.num_kv_heads, cfg.head_dim)
-        for layer_idx, (k, v) in enumerate(zip(block.keys, block.values)):
-            if tuple(k.shape) != expected:
-                raise ValueError(
-                    f"KVBlock layer {layer_idx} K shape {tuple(k.shape)}, "
-                    f"expected {expected}"
-                )
-            if tuple(v.shape) != expected:
-                raise ValueError(
-                    f"KVBlock layer {layer_idx} V shape {tuple(v.shape)}, "
-                    f"expected {expected}"
-                )
-            if k.dtype != cfg.dtype or v.dtype != cfg.dtype:
-                raise ValueError(
-                    f"KVBlock layer {layer_idx} dtype K={k.dtype} V={v.dtype}, "
-                    f"expected {cfg.dtype}"
-                )
