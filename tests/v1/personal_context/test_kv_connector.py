@@ -42,14 +42,36 @@ HEAD_DIM = 8
 def _fake_vllm_config(
     block_size: int = BLOCK_SIZE,
     kv_connector_extra_config: dict | None = None,
+    with_model_config: bool = False,
 ):
-    return SimpleNamespace(
+    """Minimal fake of ``VllmConfig`` for the connector.
+
+    ``with_model_config=True`` adds a ``model_config`` substruct whose
+    ``hf_config`` agrees numerically with the test BLOCK/NUM_LAYERS/
+    NUM_KV_HEADS/HEAD_DIM constants. Required when exercising
+    ``_derive_store_config`` (Redis backend) — pure scheduler-side
+    tests can leave it off.
+    """
+    cfg = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
             kv_connector="PersonalContextKVConnector",
             kv_connector_extra_config=kv_connector_extra_config or {},
         ),
         cache_config=SimpleNamespace(block_size=block_size),
     )
+    if with_model_config:
+        cfg.model_config = SimpleNamespace(
+            model="test/model",
+            dtype=torch.float32,
+            hf_config=SimpleNamespace(
+                num_hidden_layers=NUM_LAYERS,
+                num_key_value_heads=NUM_KV_HEADS,
+                num_attention_heads=NUM_KV_HEADS,
+                hidden_size=NUM_KV_HEADS * HEAD_DIM,
+                rope_theta=10000.0,
+            ),
+        )
+    return cfg
 
 
 def _fake_kv_cache_config():
@@ -1282,6 +1304,149 @@ def test_test_bind_overrides_config_selector():
             assert isinstance(c._selector, NoSelection)
         finally:
             os.environ.pop("VLLM_PERSONAL_CONTEXT_TEST_BIND", None)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+# ----------------------- storage backend resolved from config -----------
+
+
+def _connector_with_storage_config(
+    extra: dict, **fake_kwargs
+) -> PersonalContextKVConnector:
+    return PersonalContextKVConnector(
+        _fake_vllm_config(
+            kv_connector_extra_config=extra,
+            with_model_config=True,
+            **fake_kwargs,
+        ),
+        KVConnectorRole.SCHEDULER,
+        _fake_kv_cache_config(),
+    )
+
+
+def test_storage_default_unbound():
+    c = _connector_with_storage_config({})
+    assert c._storage is None
+    assert c._lookup is None
+
+
+def test_storage_backend_memory_is_noop():
+    """``store_backend='memory'`` is explicit-but-still-unbound — the
+    caller is expected to ``bind_storage`` directly afterwards."""
+    c = _connector_with_storage_config({"store_backend": "memory"})
+    assert c._storage is None
+
+
+def test_storage_backend_unknown_logs_and_unbound():
+    c = _connector_with_storage_config({"store_backend": "totally-made-up"})
+    assert c._storage is None
+
+
+def test_storage_backend_redis_without_url_unbound():
+    c = _connector_with_storage_config({"store_backend": "redis"})
+    assert c._storage is None
+
+
+def test_storage_backend_redis_with_url_binds(monkeypatch):
+    """Config-driven Redis binding: connector init builds a
+    ``RedisKVStorage`` against the configured URL and binds it. We
+    monkeypatch ``redis.Redis.from_url`` so no real server is needed.
+    """
+    fakeredis = pytest.importorskip("fakeredis")
+    import redis as _redis
+
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(
+        _redis.Redis, "from_url", classmethod(lambda cls, url, **kw: fake)
+    )
+
+    c = _connector_with_storage_config(
+        {
+            "store_backend": "redis",
+            "store_url": "redis://does-not-matter:6379",
+        }
+    )
+    from vllm.v1.personal_context.redis_storage import RedisKVStorage
+
+    assert isinstance(c._storage, RedisKVStorage)
+    assert c._lookup is not None
+    # Schema check wrote ``pc:config`` once.
+    assert fake.get(b"pc:config") is not None
+
+
+def test_storage_backend_redis_schema_mismatch_unbound(monkeypatch):
+    """Pre-seed fakeredis with a config that disagrees with the
+    connector's derived StoreConfig → RedisKVStorage init raises →
+    connector stays unbound rather than crashing engine startup."""
+    fakeredis = pytest.importorskip("fakeredis")
+    import pickle
+
+    import redis as _redis
+
+    fake = fakeredis.FakeRedis()
+    # Pre-seed with a config that disagrees (different num_layers).
+    bad_cfg = StoreConfig(
+        model_id="test/model",
+        dtype=torch.float32,
+        layout="NHD",
+        num_layers=NUM_LAYERS + 5,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        block_size=BLOCK_SIZE,
+    )
+    fake.set(b"pc:config", pickle.dumps(bad_cfg))
+
+    monkeypatch.setattr(
+        _redis.Redis, "from_url", classmethod(lambda cls, url, **kw: fake)
+    )
+
+    c = _connector_with_storage_config(
+        {
+            "store_backend": "redis",
+            "store_url": "redis://does-not-matter:6379",
+        }
+    )
+    # RedisKVStorage init raised; connector swallowed and stayed unbound.
+    assert c._storage is None
+
+
+def test_env_var_pickle_overrides_config_redis(monkeypatch):
+    """``VLLM_PERSONAL_CONTEXT_TEST_BIND`` wins over a Redis-configured
+    backend so GPU e2e tests can inject populated InMemoryStorage
+    fixtures without rewriting the engine config.
+    """
+    fakeredis = pytest.importorskip("fakeredis")
+    import pickle
+    import tempfile
+
+    import redis as _redis
+
+    fake = fakeredis.FakeRedis()
+    monkeypatch.setattr(
+        _redis.Redis, "from_url", classmethod(lambda cls, url, **kw: fake)
+    )
+
+    in_mem_store = InMemoryStorage(_store_config())
+
+    fd, path = tempfile.mkstemp(suffix=".pkl", prefix="pc_test_")
+    os.close(fd)
+    try:
+        with open(path, "wb") as f:
+            pickle.dump({"storage": in_mem_store}, f)
+        monkeypatch.setenv("VLLM_PERSONAL_CONTEXT_TEST_BIND", path)
+
+        c = _connector_with_storage_config(
+            {
+                "store_backend": "redis",
+                "store_url": "redis://does-not-matter:6379",
+            }
+        )
+        # Env-var bind ran AFTER config init, so InMemoryStorage wins.
+        assert isinstance(c._storage, InMemoryStorage)
     finally:
         try:
             os.unlink(path)

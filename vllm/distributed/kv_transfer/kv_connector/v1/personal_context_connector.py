@@ -178,7 +178,11 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
             kv_cache_config=kv_cache_config,
         )
         self._block_size = vllm_config.cache_config.block_size
-        self._storage: InMemoryStorage | None = None
+        # Storage is duck-typed: any object exposing the put/get/lookup/
+        # __contains__/__len__/config surface of ``InMemoryStorage``
+        # works. Concrete implementations today: ``InMemoryStorage`` and
+        # ``RedisKVStorage``.
+        self._storage: Any = None
         self._lookup: _StorageLookup | None = None
         # Step 3 state: request_id → (plan, num_external_tokens). Drained
         # by ``build_connector_meta`` (Step 4) once metadata is shipped.
@@ -201,6 +205,14 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
         #      Wins so GPU e2e tests can plug in arbitrary selectors
         #      without touching engine config.
         self._selector: Selector | None = self._resolve_selector_from_config()
+        # Storage resolution mirrors selector's three-tier policy:
+        #   1. ``None`` default (caller must ``bind_storage`` manually).
+        #   2. ``kv_connector_extra_config.store_backend`` from engine
+        #      config — production path (e.g. Redis backend).
+        #   3. ``VLLM_PERSONAL_CONTEXT_TEST_BIND`` pickle — test path,
+        #      wins so GPU e2e tests can inject populated InMemoryStorage
+        #      instances without touching engine config.
+        self._maybe_init_storage_from_config()
         self._maybe_auto_bind_from_env()
 
     def _resolve_selector_from_config(self) -> Selector | None:
@@ -268,6 +280,111 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
         )
         return None
 
+    def _derive_store_config(self) -> "StoreConfig":
+        """Build a ``StoreConfig`` from the running engine's model + cache
+        configuration.
+
+        Used by the config-driven storage path (e.g. Redis) so the
+        connector hands the client a ``StoreConfig`` that matches what
+        vLLM is about to scatter into. Mismatch against an existing
+        server-side config surfaces immediately as ``ValueError`` from
+        the storage's schema check.
+        """
+        from vllm.v1.personal_context.entry import StoreConfig
+
+        model_cfg = self._vllm_config.model_config
+        hf_cfg = model_cfg.hf_config
+
+        num_layers = hf_cfg.num_hidden_layers
+        num_kv_heads = getattr(
+            hf_cfg, "num_key_value_heads", hf_cfg.num_attention_heads
+        )
+        head_dim = hf_cfg.hidden_size // hf_cfg.num_attention_heads
+
+        return StoreConfig(
+            model_id=model_cfg.model,
+            dtype=model_cfg.dtype,
+            layout="NHD",
+            num_layers=num_layers,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            block_size=self._block_size,
+        )
+
+    def _maybe_init_storage_from_config(self) -> None:
+        """Build a storage backend from ``kv_connector_extra_config``.
+
+        Recognised ``store_backend`` values:
+
+            ``None`` / ``"memory"`` → no-op. Caller must ``bind_storage``
+                explicitly (test path) or supply a pickle via
+                ``VLLM_PERSONAL_CONTEXT_TEST_BIND``.
+            ``"redis"`` → build ``RedisKVStorage`` against
+                ``store_url`` and bind it. Schema is auto-verified
+                against any existing ``pc:config`` key in Redis.
+
+        Unknown backends log and stay unbound. ``RedisKVStorage`` init
+        failures (server unreachable, schema mismatch, etc.) also log
+        and stay unbound — the connector then behaves as if no storage
+        is configured, i.e. all requests fall back to full prefill.
+        """
+        extra = self._kv_transfer_config.kv_connector_extra_config or {}
+        backend = extra.get("store_backend")
+        if backend is None or backend == "memory":
+            return
+        if backend != "redis":
+            logger.warning(
+                "PersonalContextKVConnector: unknown store_backend %r; "
+                "staying unbound (request will fall back to full prefill).",
+                backend,
+            )
+            return
+
+        url = extra.get("store_url")
+        if not url:
+            logger.warning(
+                "PersonalContextKVConnector: store_backend='redis' but "
+                "store_url is missing or empty; staying unbound."
+            )
+            return
+
+        try:
+            store_config = self._derive_store_config()
+        except Exception:
+            logger.exception(
+                "PersonalContextKVConnector: failed to derive StoreConfig "
+                "from vllm_config; staying unbound."
+            )
+            return
+
+        try:
+            from vllm.v1.personal_context.redis_storage import RedisKVStorage
+
+            storage = RedisKVStorage(store_config, url=url)
+        except Exception:
+            logger.exception(
+                "PersonalContextKVConnector: RedisKVStorage init failed "
+                "(url=%s); staying unbound.",
+                url,
+            )
+            return
+
+        try:
+            self.bind_storage(storage)
+        except Exception:
+            logger.exception(
+                "PersonalContextKVConnector: bind_storage failed for "
+                "RedisKVStorage; staying unbound."
+            )
+            return
+
+        logger.info(
+            "PersonalContextKVConnector: storage backend=redis bound "
+            "(url=%s, %d blocks visible).",
+            url,
+            len(storage),
+        )
+
     def _maybe_auto_bind_from_env(self) -> None:
         """If ``VLLM_PERSONAL_CONTEXT_TEST_BIND`` is set, load the pickle
         at that path and apply ``bind_storage`` / ``bind_selector``.
@@ -324,13 +441,18 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
         """
         self._selector = selector
 
-    def bind_storage(self, storage: InMemoryStorage) -> None:
+    def bind_storage(self, storage: Any) -> None:
         """Attach a pre-built storage backend.
 
-        The skeleton has no production retrieval pipeline; tests and
-        Phase 12 wiring use this hook to install a populated store.
-        When unbound, ``get_num_new_matched_tokens`` reports zero
-        matched tokens (i.e. the connector is effectively disabled).
+        Duck-typed: ``storage`` only needs to expose the public
+        interface of ``InMemoryStorage`` (``config`` property +
+        ``put`` / ``get`` / ``lookup`` / ``__contains__`` / ``__len__``).
+        Concrete implementations available: ``InMemoryStorage``
+        (process-local, used by tests via the pickle bridge) and
+        ``RedisKVStorage`` (cross-process, used by the production
+        config-driven path). When unbound,
+        ``get_num_new_matched_tokens`` reports zero matched tokens
+        (i.e. the connector is effectively disabled).
         """
         if self._block_size != storage.config.block_size:
             raise ValueError(
