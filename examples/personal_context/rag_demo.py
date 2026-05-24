@@ -45,11 +45,18 @@ Usage:
     .venv/bin/python examples/personal_context/rag_demo.py --top_k 3 --selector_r 1.0
     .venv/bin/python examples/personal_context/rag_demo.py \
         --data examples/personal_context/my_data.jsonl
+
+Redis backend (Phase 12.2 — KV blocks shared via Redis instead of pickle):
+    docker run -d --name pc-redis -p 6379:6379 redis/redis-stack-server
+    .venv/bin/python examples/personal_context/rag_demo.py \
+        --store_backend redis \
+        --store_url redis://localhost:6379
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import os
@@ -80,6 +87,7 @@ from vllm.v1.personal_context import InMemoryStorage  # noqa: E402
 
 DEFAULT_DATA_PATH = Path(__file__).parent / "sample_data.jsonl"
 DEFAULT_EMBEDDER = "sentence-transformers/all-MiniLM-L6-v2"
+DEFAULT_REDIS_URL = "redis://localhost:6379"
 
 
 # ----------------------- index entry -----------------------
@@ -104,6 +112,32 @@ class IndexEntry:
     old_pos_start: int
 
 
+# ----------------------- storage factory -----------------------
+
+
+def _build_kv_store(preset, block_size: int, backend: str, url: str):
+    """Build the encoder-side KV store matching the worker-side backend.
+
+    Worker-side connector chooses its own backend from
+    ``kv_connector_extra_config`` (see ``_maybe_init_storage_from_config``
+    in the connector). For the writes from the encoder process to be
+    visible to the worker, both sides must point at the same backing
+    store; for ``redis`` that's the Redis URL, for ``memory`` it's the
+    pickle bridge.
+    """
+    cfg = store_config_for(preset, block_size=block_size)
+    if backend == "memory":
+        return InMemoryStorage(cfg)
+    if backend == "redis":
+        from vllm.v1.personal_context.redis_storage import RedisKVStorage
+
+        print(f"[index] connecting to Redis at {url}")
+        return RedisKVStorage(cfg, url=url)
+    raise ValueError(
+        f"unknown store_backend {backend!r}; must be 'memory' or 'redis'"
+    )
+
+
 # ----------------------- index -----------------------
 
 
@@ -113,6 +147,17 @@ class RAGIndex:
     Holds everything index-side in one object so VRAM cleanup
     (``free_index_models``) before the vLLM engine starts is a single
     method call.
+
+    ``store_backend`` selects how the encoded KV blocks reach the vLLM
+    worker:
+
+        - ``"memory"`` → ``InMemoryStorage`` here, pickle-bridged to the
+          worker via ``VLLM_PERSONAL_CONTEXT_TEST_BIND`` env var. Test /
+          quick-demo path.
+        - ``"redis"`` → ``RedisKVStorage`` against ``store_url``. Worker
+          builds its own ``RedisKVStorage`` against the same URL via
+          ``kv_connector_extra_config``. Cross-process via Redis instead
+          of pickle. Production / Phase 12 path.
     """
 
     def __init__(
@@ -121,6 +166,8 @@ class RAGIndex:
         embedder_model_id: str = DEFAULT_EMBEDDER,
         block_size: int = 16,
         device: str = "cuda",
+        store_backend: str = "memory",
+        store_url: str = DEFAULT_REDIS_URL,
     ):
         try:
             import faiss  # noqa: F401  (validate availability)
@@ -150,8 +197,13 @@ class RAGIndex:
         print(f"[index] loading embedder: {embedder_model_id}")
         self.embedder = SentenceTransformer(embedder_model_id, device=device)
 
-        self.kv_store = InMemoryStorage(
-            store_config_for(preset, block_size=block_size)
+        self.store_backend = store_backend
+        self.store_url = store_url
+        self.kv_store = _build_kv_store(
+            preset=preset,
+            block_size=block_size,
+            backend=store_backend,
+            url=store_url,
         )
         self.entries: list[IndexEntry] = []
         self.faiss_index: Any = None
@@ -453,6 +505,27 @@ def main() -> None:
         help="sentence-transformers model id.",
     )
     parser.add_argument(
+        "--store_backend",
+        type=str,
+        default="memory",
+        choices=["memory", "redis"],
+        help=(
+            "KV store backend. 'memory' = process-local InMemoryStorage "
+            "bridged to the vLLM worker via pickle (test path, default). "
+            "'redis' = RedisKVStorage shared with the worker via "
+            "kv_connector_extra_config; requires a running Redis instance "
+            "(e.g. `docker run -d -p 6379:6379 redis/redis-stack-server`)."
+        ),
+    )
+    parser.add_argument(
+        "--store_url",
+        type=str,
+        default=DEFAULT_REDIS_URL,
+        help=(
+            "Redis URL when --store_backend=redis. Ignored for memory."
+        ),
+    )
+    parser.add_argument(
         "--gpu_memory_utilization",
         type=float,
         default=0.85,
@@ -482,6 +555,8 @@ def main() -> None:
         embedder_model_id=args.embedder,
         block_size=16,
         device="cuda",
+        store_backend=args.store_backend,
+        store_url=args.store_url,
     )
     index.ingest_instances(instances)
     index.build_faiss()
@@ -501,20 +576,35 @@ def main() -> None:
     kv_store = index.kv_store
     index.free_index_models()
 
-    # 5. Boot vLLM with PC connector.
+    # 5. Boot vLLM with PC connector. Worker-side storage binding
+    #    depends on backend:
+    #      memory → pickle bridge via VLLM_PERSONAL_CONTEXT_TEST_BIND
+    #               (storage object travels in a tempfile)
+    #      redis  → kv_connector_extra_config carries backend + URL;
+    #               worker builds its own RedisKVStorage. No pickle.
     from vllm import LLM, SamplingParams
     from vllm.config import KVTransferConfig
     from vllm.inputs import TokensPrompt
 
+    extra: dict = {
+        "selector": {"type": "SelectFirstR", "r": args.selector_r},
+    }
+    if args.store_backend == "redis":
+        extra["store_backend"] = "redis"
+        extra["store_url"] = args.store_url
+
     kv_transfer_config = KVTransferConfig(
         kv_connector="PersonalContextKVConnector",
         kv_role="kv_both",
-        kv_connector_extra_config={
-            "selector": {"type": "SelectFirstR", "r": args.selector_r},
-        },
+        kv_connector_extra_config=extra,
     )
 
-    with _pc_test_bind_storage(kv_store):
+    if args.store_backend == "memory":
+        worker_bind_ctx = _pc_test_bind_storage(kv_store)
+    else:
+        worker_bind_ctx = contextlib.nullcontext()
+
+    with worker_bind_ctx:
         llm = LLM(
             model=preset.hf_id,
             dtype="float16",
