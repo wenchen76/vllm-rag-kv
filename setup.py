@@ -1134,6 +1134,8 @@ setup(
             # In-process Redis emulator for unit tests; tiny (~50KB).
             # Drop if shrinking install size matters.
             "fakeredis>=2.20.0",
+            # Used by bench_prefill.py for ROUGE-L quality scoring.
+            "rouge-score>=0.1.2",
         ],
     },
     cmdclass=cmdclass,

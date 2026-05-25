@@ -1,70 +1,65 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Phase 13 bench: TTFT + perplexity + recovery vs selector_r.
+"""Phase 13 bench: TTFT + generation-quality + recovery vs selector_r.
 
-Measures, per ``(selector_r, query)`` pair, **two** things — split
-into two separate ``llm.generate`` calls because they need different
-prompts:
+Per ``(selector_r, query)`` we make two ``llm.generate`` calls:
 
-    1. **TTFT (Time To First Token)** — wall-clock around a
-       ``max_tokens=1`` generate on the *production* prompt
-       ``sys + chunks + query``. This is the prefill latency a user
-       would actually see; sampling happens right after the query
-       token (not after gold), so this number is comparable to a real
-       deployment's TTFT.
+    1. **Call 1 — TTFT measurement** (``max_tokens=1``):
+       prompt is the *production* ``sys + chunks + query``. Wall-clock
+       around the call is the latency a real user would see. PC's
+       sparse-Q activates here at the configured ``r``, leaving the
+       r-specific chunk K/V in vLLM's prefix cache.
 
-    2. **Perplexity over the gold answer** — teacher-forcing via a
-       SECOND ``max_tokens=1`` generate whose prompt is
-       ``sys + chunks + query + gold``, with ``prompt_logprobs=1``.
-       vLLM's prefix cache reuses Call 1's K/V state (which carries
-       the r-specific PC reuse fingerprint), so Call 2 only
-       forward-passes the gold tail, returning logprobs at each gold
-       position. Mean NLL → ``exp`` → perplexity.
+    2. **Call 2 — generation for quality scoring** (``max_tokens=128``):
+       same prompt as Call 1. vLLM's prefix cache hits the full
+       prefill, so this call only runs decode against the r-specific
+       cached K/V. Generated text reflects the r-specific cache state
+       end-to-end.
 
-The two calls must be in this order — otherwise Call 2 would prime
-the prefix cache and Call 1 would measure a near-zero prefill
-(invalid).
+Quality is scored on the generated text via two complementary metrics:
 
-From the per-query perplexities we compute **recovery** at each
-intermediate r:
+    - **ROUGE-L** (lexical): catches single-token factual flips
+      (``"Yes"`` ↔ ``"No"``, ``"May 16"`` ↔ ``"May 6"``) that
+      perplexity averaging would dilute. Costs ~ms.
+    - **Cosine sim** on sentence-transformer embeddings (semantic):
+      tolerant to paraphrasing, catches "totally off topic" cases
+      ROUGE might miss. Reuses the existing demo embedder.
 
-    recovery(r) = (ppl_stale - ppl_hybrid(r)) / (ppl_stale - ppl_gold)
+Recovery at each intermediate r (where 1.0 = full quality recovered,
+0.0 = no better than stale):
 
-where ``ppl_stale`` = ppl at r=0.0 (full reuse, no recomputation)
-and ``ppl_gold`` = ppl at r=1.0 (full recomputation, vanilla
-equivalent). 1.0 = full quality recovered with partial recompute;
-0.0 = no better than stale. recovery is intentionally only computed
-for intermediate r in (0, 1); the endpoints are 0 and 1 by
-construction.
+    recovery_metric(r) = (q(r) - q_stale) / (q_gold - q_stale)
+
+with ``q`` being either rouge_l or cos_sim, ``q_stale`` at r=0.0
+(worst), ``q_gold`` at r=1.0 (best).
+
+WHY NOT PERPLEXITY
+------------------
+The natural metric is perplexity over the gold answer
+(``prompt_logprobs=1`` on ``sys+chunks+query+gold``). It doesn't
+work: vLLM disables prefix caching for ``prompt_logprobs`` requests
+(cached blocks have no stored logprobs, so the engine must fresh-
+prefill the whole prompt). PC's placement validation then sees
+``num_computed_tokens=0`` and refuses to activate, so all r values
+collapse to vanilla full prefill — identical perplexity, useless
+recovery. Verified empirically (see commit history).
+
+Generation-based quality lets PC activate normally (no
+prompt_logprobs in the request), at the cost of a slower second
+call.
 
 CAVEAT — prefix cache pollution
 -------------------------------
 PC's scatter writes chunk K/V into the worker's paged cache; vLLM's
-prefix cache then captures those blocks (it hashes only on token
-sequence, not K/V content). A second request with the same prompt
-would hit the FIRST request's K/V state regardless of its own r
-value, silently disabling per-request selector tuning.
-
-This bench works around the issue by **tearing down the LLM between
-each r value** — fresh LLM → fresh prefix cache → no cross-r
-contamination. Static-r production deployments are unaffected, but
-dynamic-r needs a real fix (a known open issue, not addressed by
-this bench).
-
-CAVEAT — perplexity blind spots
--------------------------------
-Perplexity averages over all gold tokens, so a single catastrophic
-``"Yes"`` ↔ ``"No"`` flip is diluted by 50+ surrounding tokens that
-read similarly under both stale and fresh K/V. Recovery will look
-"middling" even when actual generation is wrong. To catch those
-cases, layer ROUGE / cosine-sim / LLM-judge on top of this bench
-(future work).
+prefix cache then captures those blocks. A second request with the
+same prompt would inherit the first request's K/V state regardless
+of its own r. This bench tears down the LLM between r values to
+keep that contamination from leaking across r. Static-r production
+is unaffected.
 
 Usage:
-    # vanilla redis works (we only use KV ops, no vector module)
-    redis-server --daemonize yes --port 6379
+    redis-server --daemonize yes --port 6379  # or docker
     .venv/bin/python examples/personal_context/bench_prefill.py \\
-        --store_backend redis \\
         --r_values 1.0,0.75,0.5,0.25,0.0
 """
 
@@ -75,17 +70,15 @@ import contextlib
 import dataclasses
 import gc
 import json
-import math
 import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
 
-# Repo-root on path so we can import the sibling demo helpers.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -105,6 +98,7 @@ from examples.personal_context.rag_demo import (  # noqa: E402
 
 
 DEFAULT_R_VALUES = "1.0,0.75,0.5,0.25,0.0"
+DEFAULT_GEN_TOKENS = 128
 
 
 # ----------------------------- data classes -----------------------------
@@ -112,19 +106,13 @@ DEFAULT_R_VALUES = "1.0,0.75,0.5,0.25,0.0"
 
 @dataclasses.dataclass
 class QuerySpec:
-    """All per-instance bench inputs, pre-computed once."""
+    """Pre-computed per-instance bench inputs."""
 
     instance_id: str
-    # Production-shaped prompt: sys + chunks + query. Drives TTFT.
-    prod_prompt_ids: list[int]
-    # Extended prompt: prod + gold answer tokens. Drives perplexity.
-    eval_prompt_ids: list[int]
-    # Connector reuse_plan riding in SamplingParams.extra_args.
-    reuse_params: dict
-    # Slice of eval_prompt_ids that holds the gold answer.
-    gold_start: int
-    gold_len: int
-    # Provenance for the report header.
+    query_text: str
+    gold_text: str
+    prod_prompt_ids: list[int]    # sys + chunks + query (PC-active prompt)
+    reuse_params: dict             # extra_args for the connector
     sys_len_padded: int
     chunks_total: int
 
@@ -133,7 +121,9 @@ class QuerySpec:
 class Measurement:
     instance_id: str
     ttft_ms: float
-    ppl: Optional[float]
+    generated_text: str
+    rouge_l: float
+    cos_sim: float
 
 
 # ----------------------------- helpers -----------------------------
@@ -144,12 +134,10 @@ def _build_query_specs(
     index: RAGIndex,
     args: argparse.Namespace,
 ) -> list[QuerySpec]:
-    """Pre-build prompts + reuse_plans + gold positions for every query.
+    """Pre-build the prompt + reuse_plan for every instance.
 
-    Done up-front (before any LLM boot) so the per-r loop only spends
-    time on inference, and so tokenisation surprises (e.g., a gold
-    answer that exceeds max_model_len) surface immediately rather
-    than after the first ~30s LLM load.
+    Done up-front so the per-r loop only does inference, and so any
+    tokenisation surprises surface before paying the LLM boot cost.
     """
     tokenizer = index.tokenizer
     specs: list[QuerySpec] = []
@@ -167,26 +155,15 @@ def _build_query_specs(
             inst["query"],
             block_size=args.block_size,
         )
-
-        gold_ids = tokenizer.encode(
-            inst["answer"], add_special_tokens=False
-        )
-        if len(gold_ids) == 0:
-            print(
-                f"[bench] WARN: gold for {inst['id']} tokenises to 0 "
-                "tokens; perplexity will be N/A."
-            )
-        eval_prompt_ids = list(prod_prompt_ids) + list(gold_ids)
         chunks_total = sum(len(e.token_ids) for e in retrieved)
 
         specs.append(
             QuerySpec(
                 instance_id=inst["id"],
+                query_text=inst["query"],
+                gold_text=inst["answer"],
                 prod_prompt_ids=prod_prompt_ids,
-                eval_prompt_ids=eval_prompt_ids,
                 reuse_params=reuse_params,
-                gold_start=len(prod_prompt_ids),
-                gold_len=len(gold_ids),
                 sys_len_padded=sys_len_padded,
                 chunks_total=chunks_total,
             )
@@ -194,40 +171,25 @@ def _build_query_specs(
     return specs
 
 
-def _compute_perplexity(
-    prompt_logprobs: Optional[list],
-    prompt_token_ids: list[int],
-    gold_start: int,
-    gold_len: int,
-) -> Optional[float]:
-    """Mean NLL over gold positions → ``exp`` = perplexity.
+def _score_generation(
+    gold_text: str,
+    gen_text: str,
+    embedder,
+    rouge_scorer,
+) -> tuple[float, float]:
+    """Compute (ROUGE-L F1, cosine similarity) of gen against gold."""
+    rouge_l = rouge_scorer.score(gold_text, gen_text)["rougeL"].fmeasure
 
-    Returns ``None`` when no gold logprobs are recoverable (e.g.,
-    every gold position was somehow prefix-cached pre-prefill, which
-    our two-call design should prevent in practice).
-    """
-    if gold_len == 0 or prompt_logprobs is None:
-        return None
-    nll_sum = 0.0
-    count = 0
-    for i in range(gold_start, gold_start + gold_len):
-        if i >= len(prompt_logprobs):
-            break
-        lp_dict = prompt_logprobs[i]
-        if lp_dict is None:
-            continue
-        token_id = prompt_token_ids[i]
-        lp_obj = lp_dict.get(token_id)
-        if lp_obj is None:
-            continue
-        # vLLM Logprob has .logprob (float); defensive against future
-        # API drift where the value might land directly on lp_obj.
-        lp_val = getattr(lp_obj, "logprob", lp_obj)
-        nll_sum += -float(lp_val)
-        count += 1
-    if count == 0:
-        return None
-    return math.exp(nll_sum / count)
+    # normalize_embeddings=True so we can use plain dot product as
+    # cosine similarity (avoids an explicit division).
+    vecs = embedder.encode(
+        [gold_text, gen_text],
+        normalize_embeddings=True,
+        show_progress_bar=False,
+        convert_to_numpy=True,
+    )
+    cos_sim = float((vecs[0] * vecs[1]).sum())
+    return float(rouge_l), cos_sim
 
 
 # ----------------------------- per-r bench loop -----------------------------
@@ -237,9 +199,11 @@ def _bench_for_r(
     r: float,
     query_specs: list[QuerySpec],
     sys_padded_tokens: list[int],
+    embedder,
+    rouge_scorer,
     args: argparse.Namespace,
 ) -> list[Measurement]:
-    """Boot LLM at this r, warmup, run each query (2 calls), tear down."""
+    """Boot LLM at this r, warmup, run 2-call pattern per query, tear down."""
     from vllm import LLM, SamplingParams
     from vllm.config import KVTransferConfig
     from vllm.inputs import TokensPrompt
@@ -274,9 +238,8 @@ def _bench_for_r(
 
     measurements: list[Measurement] = []
     try:
-        # Warmup: prime sys prefix-cache + JIT-compile the Triton
-        # kernels that fire on first inference. No reuse_plan in
-        # extra_args so the PC connector stays out of the way.
+        # Warmup: sys-only prompt with no reuse_plan, primes vLLM
+        # prefix-cache for sys and triggers Triton kernel JIT compile.
         print(f"[bench] r={r}: warmup (sys-only prompt)")
         llm.generate(
             [TokensPrompt(prompt_token_ids=list(sys_padded_tokens))],
@@ -286,7 +249,10 @@ def _bench_for_r(
         )
 
         for spec in query_specs:
-            # ---- Call 1: TTFT (production-shaped prompt, no gold) ----
+            # ---- Call 1: TTFT on production prompt ----
+            # PC connector activates here; sparse-Q at this r writes
+            # the r-specific chunk K/V into vLLM's paged cache, which
+            # the prefix-cache then captures for Call 2 to consume.
             sp_ttft = SamplingParams(
                 max_tokens=1,
                 temperature=0.0,
@@ -300,47 +266,49 @@ def _bench_for_r(
             t_end = time.perf_counter()
             ttft_ms = (t_end - t_start) * 1000.0
 
-            # ---- Call 2: perplexity (prod + gold, prompt_logprobs=1) ----
-            # vLLM's prefix cache covers Call 1's prompt, so this
-            # call only forward-passes the gold tail. Logprobs come
-            # back for the freshly-computed gold positions.
-            sp_ppl = SamplingParams(
-                max_tokens=1,
+            # ---- Call 2: generation for quality scoring ----
+            # Same prompt → vLLM prefix-cache hits the full prefill;
+            # this call effectively just decodes 128 tokens against
+            # the r-specific cached K/V from Call 1. PC connector
+            # logs a placement-overflow warning (harmless — there are
+            # 0 new chunk tokens to match here).
+            sp_gen = SamplingParams(
+                max_tokens=args.gen_tokens,
                 temperature=0.0,
-                prompt_logprobs=1,
                 extra_args=spec.reuse_params,
             )
             out = llm.generate(
-                [TokensPrompt(prompt_token_ids=list(spec.eval_prompt_ids))],
-                sampling_params=[sp_ppl],
+                [TokensPrompt(prompt_token_ids=list(spec.prod_prompt_ids))],
+                sampling_params=[sp_gen],
             )
-            ppl = _compute_perplexity(
-                out[0].prompt_logprobs,
-                spec.eval_prompt_ids,
-                spec.gold_start,
-                spec.gold_len,
+            gen_text = out[0].outputs[0].text
+
+            rouge_l, cos_sim = _score_generation(
+                spec.gold_text, gen_text, embedder, rouge_scorer
             )
 
-            ppl_str = f"{ppl:.4f}" if ppl is not None else "N/A"
             print(
                 f"[bench] r={r}: {spec.instance_id}: "
-                f"TTFT={ttft_ms:7.1f}ms  ppl={ppl_str}"
+                f"TTFT={ttft_ms:7.1f}ms  "
+                f"rougeL={rouge_l:.3f}  cos={cos_sim:.3f}  "
+                f"| {gen_text[:80]!r}{'...' if len(gen_text) > 80 else ''}"
             )
             measurements.append(
                 Measurement(
                     instance_id=spec.instance_id,
                     ttft_ms=ttft_ms,
-                    ppl=ppl,
+                    generated_text=gen_text,
+                    rouge_l=rouge_l,
+                    cos_sim=cos_sim,
                 )
             )
     finally:
         # Hard teardown so the next r value boots into a clean vLLM
-        # prefix cache (the whole point of per-r isolation given the
-        # scatter-pollutes-prefix-cache issue).
+        # prefix cache (else the first r's K/V leaks into all later r).
         del llm
         gc.collect()
         torch.cuda.empty_cache()
-        time.sleep(2)  # let the spawned worker process actually die
+        time.sleep(2)  # let the spawned worker actually die
 
     return measurements
 
@@ -352,7 +320,7 @@ def _print_report(
     results: dict[float, list[Measurement]],
     query_specs: list[QuerySpec],
 ) -> None:
-    """Pretty tables: prompt context, TTFT, perplexity, recovery."""
+    """Pretty tables + recovery + raw generation dump."""
     r_values = sorted(results.keys(), reverse=True)
 
     # ---- Prompt context ----
@@ -370,25 +338,24 @@ def _print_report(
             f"  {spec.instance_id:<16}  "
             f"prod_prompt={len(spec.prod_prompt_ids):>4}  "
             f"(sys={spec.sys_len_padded} + chunks={spec.chunks_total} "
-            f"+ query={query_len})  gold={spec.gold_len}"
+            f"+ query={query_len})  gold={len(spec.gold_text.split()):>3} words"
         )
+
+    header_cells = [f"r={r}" for r in r_values]
 
     # ---- TTFT table ----
     print("\n" + "-" * 100)
     print(
         "TTFT (ms) per (r, instance)  — production-shaped prompt "
-        "(sys+chunks+query)"
+        "(sys+chunks+query, max_tokens=1)"
     )
     print("-" * 100)
-    header_cells = [f"r={r}" for r in r_values]
     print(f"  {'instance':<20}" + "".join(f"{c:>12}" for c in header_cells))
     for i, spec in enumerate(query_specs):
         row = f"  {spec.instance_id:<20}"
         for r in r_values:
-            m = results[r][i]
-            row += f"{m.ttft_ms:>10.1f}  "
+            row += f"{results[r][i].ttft_ms:>10.1f}  "
         print(row)
-    # Per-r averages + delta vs r=1.0 baseline.
     print(f"  {'AVG':<20}", end="")
     for r in r_values:
         avg = sum(m.ttft_ms for m in results[r]) / len(results[r])
@@ -403,33 +370,100 @@ def _print_report(
             print(f"{pct:>+9.1f}%  ", end="")
         print()
 
-    # ---- Perplexity table ----
+    # ---- ROUGE-L table ----
+    _print_quality_table(
+        "ROUGE-L F1 per (r, instance)  — lexical overlap with gold",
+        "Higher = generated text shares more n-grams with gold (better)",
+        results,
+        query_specs,
+        r_values,
+        header_cells,
+        getter=lambda m: m.rouge_l,
+    )
+
+    # ---- Cosine sim table ----
+    _print_quality_table(
+        "Cosine sim per (r, instance)  — embedding similarity to gold",
+        "Higher = closer in semantic embedding space (better)",
+        results,
+        query_specs,
+        r_values,
+        header_cells,
+        getter=lambda m: m.cos_sim,
+    )
+
+    # ---- Recovery ----
+    _print_recovery(results, query_specs, r_values)
+
+    # ---- Generation dump ----
+    print("\n" + "=" * 100)
+    print("GENERATION DUMP")
+    print("=" * 100)
+    for i, spec in enumerate(query_specs):
+        print(f"\n[{spec.instance_id}]")
+        print(f"  Query: {spec.query_text}")
+        print(f"  Gold:  {spec.gold_text}")
+        for r in r_values:
+            m = results[r][i]
+            print(
+                f"\n  r={r}  (rougeL={m.rouge_l:.3f}, cos={m.cos_sim:.3f})"
+            )
+            # Indent the generation for readability.
+            for line in m.generated_text.strip().splitlines() or [""]:
+                print(f"    {line}")
+
+    # ---- Caveat footer ----
+    print("\n" + "=" * 100)
+    print("CAVEATS")
+    print("=" * 100)
+    print(
+        "1. TTFT numbers rely on per-r LLM teardown to keep PC's K/V scatter\n"
+        "   from leaking through vLLM's prefix cache into later r values."
+    )
+    print(
+        "2. Perplexity is NOT measured — vLLM's prompt_logprobs disables\n"
+        "   prefix caching, which prevents PC from activating, collapsing\n"
+        "   all r values to vanilla. ROUGE / cosine on generations work\n"
+        "   because no prompt_logprobs is requested."
+    )
+    print(
+        "3. ROUGE catches lexical / single-token errors that perplexity\n"
+        "   averaging dilutes. Cosine catches paraphrasing-but-correct\n"
+        "   cases ROUGE penalises. Use both, not either alone."
+    )
+
+
+def _print_quality_table(
+    title: str,
+    subtitle: str,
+    results: dict[float, list[Measurement]],
+    query_specs: list[QuerySpec],
+    r_values: list[float],
+    header_cells: list[str],
+    getter,
+) -> None:
     print("\n" + "-" * 100)
-    print(
-        "Perplexity per (r, instance)  — teacher-forced over gold answer"
-    )
-    print(
-        "  Lower = model assigns higher probability to gold tokens (better)"
-    )
+    print(title)
+    print(f"  {subtitle}")
     print("-" * 100)
     print(f"  {'instance':<20}" + "".join(f"{c:>12}" for c in header_cells))
     for i, spec in enumerate(query_specs):
         row = f"  {spec.instance_id:<20}"
         for r in r_values:
-            m = results[r][i]
-            cell = f"{m.ppl:>10.4f}" if m.ppl is not None else f"{'N/A':>10}"
-            row += f"{cell}  "
+            row += f"{getter(results[r][i]):>10.3f}  "
         print(row)
     print(f"  {'AVG':<20}", end="")
     for r in r_values:
-        ppls = [m.ppl for m in results[r] if m.ppl is not None]
-        if ppls:
-            print(f"{sum(ppls) / len(ppls):>10.4f}  ", end="")
-        else:
-            print(f"{'N/A':>10}  ", end="")
+        avg = sum(getter(m) for m in results[r]) / len(results[r])
+        print(f"{avg:>10.3f}  ", end="")
     print()
 
-    # ---- Recovery (intermediate r only) ----
+
+def _print_recovery(
+    results: dict[float, list[Measurement]],
+    query_specs: list[QuerySpec],
+    r_values: list[float],
+) -> None:
     if 1.0 not in results or 0.0 not in results:
         print(
             "\n[bench] Recovery skipped — need both r=1.0 and r=0.0 in "
@@ -447,74 +481,52 @@ def _print_report(
     print("\n" + "-" * 100)
     print("Recovery per (intermediate r, instance)")
     print(
-        "  recovery(r) = (ppl_stale - ppl_hybrid(r)) / (ppl_stale - ppl_gold)"
+        "  recovery_metric(r) = (q(r) - q_stale) / (q_gold - q_stale)"
     )
     print(
-        "  1.0  hybrid matches gold (full quality recovered "
-        "with partial recompute)"
+        "  1.0  hybrid matches gold (full quality with partial recompute)"
     )
+    print("  0.0  hybrid no better than stale (selection didn't help)")
+    print("  >1.0 hybrid better than gold (rare; lucky paraphrasing)")
+    print("  <0   hybrid worse than stale (bad strategy)")
     print(
-        "  0.0  hybrid no better than stale (selection didn't help)"
-    )
-    print(
-        "  >1.0 hybrid better than gold (rare; fp16 noise or "
-        "favourable tokens)"
-    )
-    print(
-        "  <0   hybrid worse than stale (bad selection strategy)"
+        "  N/A  endpoints collapsed (q_stale ≈ q_gold) — recovery undefined"
     )
     print("-" * 100)
-    print(
-        f"  {'instance':<20}"
-        + "".join(f"{f'r={r}':>12}" for r in intermediate)
-    )
-    sum_rec: dict[float, float] = defaultdict(float)
-    cnt_rec: dict[float, int] = defaultdict(int)
-    for i, spec in enumerate(query_specs):
-        row = f"  {spec.instance_id:<20}"
-        ppl_gold = results[1.0][i].ppl
-        ppl_stale = results[0.0][i].ppl
-        for r in intermediate:
-            ppl_hyb = results[r][i].ppl
-            if (
-                ppl_gold is None
-                or ppl_stale is None
-                or ppl_hyb is None
-            ):
-                row += f"{'N/A':>12}"
-                continue
-            denom = ppl_stale - ppl_gold
-            if abs(denom) < 1e-9:
-                # Endpoints collapsed (stale ≈ gold) — recovery undefined.
-                row += f"{'N/A':>12}"
-                continue
-            rec = (ppl_stale - ppl_hyb) / denom
-            sum_rec[r] += rec
-            cnt_rec[r] += 1
-            row += f"{rec:>11.3f} "
-        print(row)
-    print(f"  {'AVG':<20}", end="")
-    for r in intermediate:
-        if cnt_rec[r]:
-            print(f"{sum_rec[r] / cnt_rec[r]:>11.3f} ", end="")
-        else:
-            print(f"{'N/A':>12}", end="")
-    print()
 
-    # ---- Caveat footer ----
-    print("\n" + "=" * 100)
-    print("CAVEATS")
-    print("=" * 100)
-    print(
-        "1. TTFT numbers rely on per-r LLM teardown to keep PC's K/V scatter\n"
-        "   from leaking through vLLM's prefix cache into later r values."
-    )
-    print(
-        "2. Perplexity averages over ~50 gold tokens, so single-token factual\n"
-        "   flips (e.g., \"Yes\" ↔ \"No\") get diluted. Recovery may look\n"
-        "   middling while actual generation is catastrophically wrong. Layer\n"
-        "   ROUGE / cosine-sim / LLM-judge on top if you need factual checks."
-    )
+    for metric_name, getter in [
+        ("ROUGE-L", lambda m: m.rouge_l),
+        ("Cosine ", lambda m: m.cos_sim),
+    ]:
+        print(f"\n  [{metric_name}]")
+        print(
+            f"  {'instance':<20}"
+            + "".join(f"{f'r={r}':>12}" for r in intermediate)
+        )
+        sum_rec: dict[float, float] = defaultdict(float)
+        cnt_rec: dict[float, int] = defaultdict(int)
+        for i, spec in enumerate(query_specs):
+            row = f"  {spec.instance_id:<20}"
+            q_gold = getter(results[1.0][i])
+            q_stale = getter(results[0.0][i])
+            for r in intermediate:
+                q_hyb = getter(results[r][i])
+                denom = q_gold - q_stale
+                if abs(denom) < 1e-9:
+                    row += f"{'N/A':>12}"
+                    continue
+                rec = (q_hyb - q_stale) / denom
+                sum_rec[r] += rec
+                cnt_rec[r] += 1
+                row += f"{rec:>11.3f} "
+            print(row)
+        print(f"  {'AVG':<20}", end="")
+        for r in intermediate:
+            if cnt_rec[r]:
+                print(f"{sum_rec[r] / cnt_rec[r]:>11.3f} ", end="")
+            else:
+                print(f"{'N/A':>12}", end="")
+        print()
 
 
 # ----------------------------- main -----------------------------
@@ -523,7 +535,8 @@ def _print_report(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Phase 13 bench: TTFT + perplexity + recovery vs selector_r."
+            "Phase 13 bench: TTFT + generation quality (ROUGE-L, cosine) "
+            "+ recovery vs selector_r."
         )
     )
     parser.add_argument(
@@ -549,9 +562,16 @@ def main() -> None:
         type=str,
         default=DEFAULT_R_VALUES,
         help=(
-            "Comma-separated SelectFirstR.r values to sweep. Include "
-            "both 1.0 and 0.0 to enable recovery computation."
+            "Comma-separated SelectFirstR.r values. Include 1.0 and "
+            "0.0 to enable recovery computation."
         ),
+    )
+    parser.add_argument(
+        "--gen_tokens",
+        type=int,
+        default=DEFAULT_GEN_TOKENS,
+        help="Max generation length (Call 2). Should comfortably exceed "
+        "gold answer length so ROUGE recall isn't truncated.",
     )
     parser.add_argument(
         "--store_backend",
@@ -560,7 +580,7 @@ def main() -> None:
         choices=["memory", "redis"],
         help=(
             "PC store backend. 'redis' is recommended so the encoder "
-            "runs only once and all r values share the warm cache."
+            "runs only once and all r values share warm cache."
         ),
     )
     parser.add_argument(
@@ -573,7 +593,7 @@ def main() -> None:
         "--embedder",
         type=str,
         default=DEFAULT_EMBEDDER,
-        help="sentence-transformers model id (used by RAGIndex).",
+        help="sentence-transformers model id (used by index + scoring).",
     )
     parser.add_argument(
         "--block_size",
@@ -598,6 +618,7 @@ def main() -> None:
         instances = [json.loads(line) for line in f if line.strip()]
     print(f"[bench] loaded {len(instances)} instances from {args.data}")
     print(f"[bench] r values: {r_values}")
+    print(f"[bench] gen_tokens (Call 2 max_tokens): {args.gen_tokens}")
 
     preset = preset_for(args.model)
     print(
@@ -620,7 +641,6 @@ def main() -> None:
     # ----- 2. Pre-compute everything we need per query -----
     query_specs = _build_query_specs(instances, index, args)
 
-    # Sys is the same string across all sample instances; padded once.
     tokenizer = index.tokenizer
     sys_padded_tokens = _pad_tokens_to_block_size(
         tokenizer.encode(instances[0]["sys"], add_special_tokens=False),
@@ -628,15 +648,31 @@ def main() -> None:
         args.block_size,
     )
 
-    # Capture the kv_store before freeing the encoder/embedder — needed
-    # for the memory-backend pickle bridge.
+    # Keep embedder alive for scoring (it's small, ~80MB) but release
+    # the heavy HF encoder model before booting any LLM.
     kv_store = index.kv_store
-    index.free_index_models()
+    embedder = index.embedder
+    if hasattr(index, "encoder") and index.encoder is not None:
+        del index.encoder
+        index.encoder = None
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    # ----- 3. Per-r bench loop -----
+    # ----- 3. Build the rouge scorer (cheap, no model) -----
+    try:
+        from rouge_score import rouge_scorer as _rouge_scorer_mod
+    except ImportError as e:
+        raise SystemExit(
+            "rouge-score is required. Install via "
+            "`uv pip install \"rouge-score>=0.1.2\"` or "
+            "`uv pip install -e \".[personal-context]\"`."
+        ) from e
+    rouge_scorer = _rouge_scorer_mod.RougeScorer(
+        ["rougeL"], use_stemmer=True
+    )
+
+    # ----- 4. Per-r bench loop -----
     if args.store_backend == "memory":
-        # Pickle bridge stays open across every LLM boot so each
-        # worker process can unpickle the same store on init.
         outer_ctx = _pc_test_bind_storage(kv_store)
     else:
         outer_ctx = contextlib.nullcontext()
@@ -645,10 +681,15 @@ def main() -> None:
     with outer_ctx:
         for r in r_values:
             results[r] = _bench_for_r(
-                r, query_specs, sys_padded_tokens, args
+                r,
+                query_specs,
+                sys_padded_tokens,
+                embedder,
+                rouge_scorer,
+                args,
             )
 
-    # ----- 4. Report -----
+    # ----- 5. Report -----
     _print_report(results, query_specs)
 
 
