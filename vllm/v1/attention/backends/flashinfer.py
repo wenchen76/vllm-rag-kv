@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import ClassVar
@@ -932,6 +933,55 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             q_positions_prefill_cpu=q_positions_prefill_cpu,
             seq_lens_prefill_cpu=seq_lens_prefill_cpu,
         )
+        if os.environ.get("VLLM_PC_DEBUG_SPARSE_Q"):
+            qo_list = qo_indptr_prefill_cpu.tolist()
+            seq_list = seq_lens_prefill_cpu.tolist()
+            logger.debug(
+                "PC sparse-Q _build_pc_custom_mask:"
+                " num_prefills=%d num_decodes=%d"
+                " qo_indptr_prefill=%s seq_lens_prefill=%s"
+                " q_positions_prefill=%s mask_shape=%s mask_dtype=%s"
+                " mask_n_true=%d mask_n_total=%d",
+                num_prefills,
+                num_decodes,
+                qo_list,
+                seq_list,
+                q_positions_prefill_cpu.tolist(),
+                tuple(mask_cpu.shape),
+                mask_cpu.dtype,
+                int(mask_cpu.sum().item()),
+                int(mask_cpu.numel()),
+            )
+            # Per-prefill-request: show the (Q × KV) sub-mask. For each
+            # Q row, log the column index of the rightmost True entry —
+            # easy to eyeball against the expected causal+selected
+            # pattern.
+            offset = 0
+            for r in range(num_prefills):
+                q_lo = qo_list[r]
+                q_hi = qo_list[r + 1]
+                kv_len = seq_list[r]
+                n_rows = q_hi - q_lo
+                sub = mask_cpu[offset : offset + n_rows * kv_len].view(
+                    n_rows, kv_len
+                )
+                q_pos = q_positions_prefill_cpu[q_lo:q_hi].tolist()
+                rightmost = [
+                    int(sub[i].nonzero(as_tuple=False)[-1, 0].item())
+                    if int(sub[i].sum().item()) > 0
+                    else -1
+                    for i in range(n_rows)
+                ]
+                logger.debug(
+                    "PC sparse-Q   req%d: kv_len=%d n_q_rows=%d"
+                    " q_positions=%s rightmost_true_kv_col=%s",
+                    r,
+                    kv_len,
+                    n_rows,
+                    q_pos,
+                    rightmost,
+                )
+                offset += n_rows * kv_len
         return mask_cpu.to(self.device, non_blocking=True)
 
     def build(

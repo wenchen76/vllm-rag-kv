@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -1913,7 +1914,106 @@ class GPUModelRunner(
             if positions_lists
             else np.empty((0,), dtype=np.int64)
         )
+        # (debug print below; helper for diff-mode KV dump lives at the
+        # end of this method block — see _maybe_diff_dump_kv.)
+        if os.environ.get("VLLM_PC_DEBUG_SPARSE_Q"):
+            logger.debug(
+                "PC sparse-Q _pc_build_sparse_q_arrays:"
+                " num_reqs=%d input_num_scheduled=%s"
+                " effective_num_scheduled=%s effective_total=%d",
+                num_reqs,
+                num_scheduled_tokens.tolist(),
+                effective.tolist(),
+                int(positions_np.shape[0]),
+            )
+            for req_idx in range(num_reqs):
+                num_computed = int(
+                    self.input_batch.num_computed_tokens_cpu[req_idx]
+                )
+                sel = pc_overrides.get(req_idx)
+                start = int(np.sum(effective[:req_idx]))
+                end = start + int(effective[req_idx])
+                per_req = positions_np[start:end].tolist()
+                logger.debug(
+                    "PC sparse-Q   req_idx=%d num_computed=%d"
+                    " n_query=%d selected=%s positions=%s",
+                    req_idx,
+                    num_computed,
+                    int(num_scheduled_tokens[req_idx]),
+                    list(sel) if sel else None,
+                    per_req,
+                )
         return effective, int(positions_np.shape[0]), positions_np
+
+    def _maybe_diff_dump_kv(self) -> None:
+        """One-shot post-forward dump of K (and V) from the paged cache.
+
+        Gated by ``VLLM_DIFF_DUMP_K=path``; writes a pickle of
+        ``{layer_idx: {"K": tensor, "V": tensor, "layout": "block_first"
+        | "kv_first"}}``, where each tensor is the first
+        ``VLLM_DIFF_DUMP_K_NBLOCKS`` (default 64) physical blocks moved
+        to CPU.
+
+        ``VLLM_DIFF_DUMP_K_SKIP=N`` (default 0) skips the first N forward
+        passes before dumping — useful when an earlier forward (e.g. a
+        sys-only warmup) primes the prefix cache and the interesting
+        forward is the next one.
+
+        After dumping once, sets ``self._diff_dump_done`` and becomes a
+        no-op so multi-step generation doesn't keep re-pickling. No-op
+        if ``self.kv_caches`` is empty.
+        """
+        if getattr(self, "_diff_dump_done", False):
+            return
+        if not getattr(self, "kv_caches", None):
+            return
+        try:
+            skip_n = int(os.environ.get("VLLM_DIFF_DUMP_K_SKIP", "0"))
+        except ValueError:
+            skip_n = 0
+        skipped = getattr(self, "_diff_dump_skipped", 0)
+        if skipped < skip_n:
+            self._diff_dump_skipped = skipped + 1
+            return
+        path = os.environ["VLLM_DIFF_DUMP_K"]
+        try:
+            n_blocks = int(
+                os.environ.get("VLLM_DIFF_DUMP_K_NBLOCKS", "64")
+            )
+        except ValueError:
+            n_blocks = 64
+
+        import pickle  # noqa: PLC0415 — debug-only path
+
+        data: dict[int, dict[str, object]] = {}
+        for layer_idx, cache in enumerate(self.kv_caches):
+            if cache is None or cache.dim() != 5:
+                continue
+            # Layout per ``vllm.v1.personal_context.scatter._detect_kv_layout``:
+            # cache[:, 0|1, ...] vs cache[0|1, :, ...].
+            if cache.shape[1] == 2:
+                layout = "block_first"
+                upto = min(n_blocks, cache.shape[0])
+                k = cache[:upto, 0].detach().clone().cpu()
+                v = cache[:upto, 1].detach().clone().cpu()
+            elif cache.shape[0] == 2:
+                layout = "kv_first"
+                upto = min(n_blocks, cache.shape[1])
+                k = cache[0, :upto].detach().clone().cpu()
+                v = cache[1, :upto].detach().clone().cpu()
+            else:
+                continue
+            data[layer_idx] = {"K": k, "V": v, "layout": layout}
+
+        with open(path, "wb") as f:
+            pickle.dump(data, f)
+        self._diff_dump_done = True
+        logger.info(
+            "VLLM-DIFF-DUMP wrote %d layers x [%d blocks] K/V to %s",
+            len(data),
+            upto,
+            path,
+        )
 
     def _prepare_inputs(
         self,
@@ -4335,6 +4435,14 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        # Diff-mode KV dump: writes per-layer K (and V) for the first N
+        # physical blocks to a pickle file, one-shot, gated by env var.
+        # Used by ``examples/personal_context/diff_encoder_vs_vanilla_k.py``
+        # to compare encoder K vs the K vLLM actually computes; off by
+        # default and short-circuits inside the helper when unset.
+        if os.environ.get("VLLM_DIFF_DUMP_K"):
+            self._maybe_diff_dump_kv()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

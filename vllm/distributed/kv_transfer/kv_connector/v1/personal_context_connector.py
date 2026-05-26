@@ -32,6 +32,7 @@ under an alias to keep the public class name unambiguous.
 from __future__ import annotations
 
 import itertools
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.personal_context.load import LoadedPlan
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -68,15 +70,51 @@ logger = init_logger(__name__)
 def _derive_rope_theta(vllm_config: Any) -> float:
     """Best-effort lookup of the model's RoPE base.
 
-    Production ``VllmConfig`` exposes
-    ``vllm_config.model_config.hf_config.rope_theta``; minimal test
-    fixtures may not. Falls back to ``10000.0`` (the apply_rope default)
-    on any missing attribute or unparseable value.
+    vLLM exposes the HF config under a few different attribute names
+    depending on model family / vLLM version. We probe in order:
+
+      1. ``vllm_config.model_config.hf_config.rope_theta``
+      2. ``vllm_config.model_config.hf_text_config.rope_theta``
+         (multimodal wrapper — text config is nested)
+      3. ``rope_scaling.rope_theta`` (some configs nest it)
+
+    Returns ``10000.0`` (apply_rope default) only if none of these yield
+    a usable value. A wrong fallback silently rotates stored K with the
+    wrong base, producing K that drifts catastrophically from vanilla —
+    we log at WARNING to make this visible.
     """
+    candidates = []
     try:
-        return float(vllm_config.model_config.hf_config.rope_theta)
-    except (AttributeError, TypeError, ValueError):
-        return 10000.0
+        candidates.append(vllm_config.model_config.hf_config.rope_theta)
+    except AttributeError:
+        pass
+    try:
+        candidates.append(
+            vllm_config.model_config.hf_text_config.rope_theta
+        )
+    except AttributeError:
+        pass
+    try:
+        rs = vllm_config.model_config.hf_config.rope_scaling
+        if isinstance(rs, dict) and "rope_theta" in rs:
+            candidates.append(rs["rope_theta"])
+    except AttributeError:
+        pass
+
+    for c in candidates:
+        try:
+            return float(c)
+        except (TypeError, ValueError):
+            continue
+
+    logger.warning(
+        "PersonalContextKVConnector: could not derive rope_theta from "
+        "model_config; falling back to 10000.0. Stored K will be "
+        "rotated with the wrong base and silently corrupted. Probed "
+        "attributes: %s",
+        [type(getattr(vllm_config, "model_config", None)).__name__]
+    )
+    return 10000.0
 
 
 @dataclass(frozen=True)
@@ -856,6 +894,35 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
                     req_meta.request_id,
                 )
                 continue
+            if os.environ.get("VLLM_PC_DEBUG_SPARSE_Q"):
+                # Inspect the raw stored K (PRE delta-RoPE) right before
+                # load_plan runs so we can verify it matches what the
+                # encoder produced. Dump last block's last slot — historical
+                # bug context: a silently-fallback rope_theta surfaced as a
+                # mismatch only at the LAST chunk slot when the diff
+                # script's per-position cos breakdown narrowed it down.
+                lookup_chunks = lookup_result.chunks
+                if lookup_chunks and lookup_chunks[0].blocks:
+                    bl_last = lookup_chunks[0].blocks[-1]
+                    if bl_last is not None and bl_last.block is not None:
+                        k0_pre = bl_last.block.keys[0]
+                        logger.debug(
+                            "PC sparse-Q storage K (PRE delta-RoPE)"
+                            " req=%s chunk=0 block=%d slot=15"
+                            " dtype=%s shape=%s"
+                            " k0[:8]=%s"
+                            " block.old_pos_start=%s"
+                            " new_pos_starts=%s"
+                            " rope_theta=%s",
+                            req_meta.request_id,
+                            len(lookup_chunks[0].blocks) - 1,
+                            k0_pre.dtype,
+                            tuple(k0_pre.shape),
+                            k0_pre[15, 0, :8].float().cpu().tolist(),
+                            bl_last.block.old_pos_start,
+                            req_meta.new_pos_starts,
+                            self._rope_theta,
+                        )
             loaded = load_plan(
                 lookup_result,
                 req_meta.new_pos_starts,
@@ -864,6 +931,102 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
             scatter_loaded_plan(
                 loaded, kv_caches, req_meta.block_assignments
             )
+            if os.environ.get("VLLM_PC_DEBUG_SPARSE_Q"):
+                self._debug_dump_scattered_slots(
+                    req_meta, kv_caches, loaded
+                )
+
+    def _debug_dump_scattered_slots(
+        self,
+        req_meta: "PersonalContextReqMeta",
+        kv_caches: list[torch.Tensor],
+        loaded: "LoadedPlan",
+    ) -> None:
+        """Print a compact summary of K values at the first scattered slot
+        on layer 0 — used to compare fresh vs stale K across r values.
+
+        For the very first (chunk, block) pair with a non-None assignment,
+        reads kv_caches[0][:, physical_block_id, 0, 0, :] (K only, position
+        0 within block, head 0, all head_dim) and prints stats + first
+        elements. Layout-aware via _detect_kv_layout to handle both NHD/HND.
+        """
+        try:
+            from vllm.v1.personal_context.scatter import _detect_kv_layout
+        except Exception:
+            return
+        if not kv_caches:
+            return
+        # Log the full block_assignments so we can verify external diff
+        # scripts' chunk_block_ids assumption against what PC actually
+        # used.
+        logger.debug(
+            "PC sparse-Q block_assignments req=%s: %s",
+            req_meta.request_id,
+            [list(c) for c in req_meta.block_assignments],
+        )
+        # Dump every (chunk_block, slot=0 and slot=last) at layer 0 head 0,
+        # comparing cache value vs expected encoder K (already delta-RoPE'd).
+        # This catches scatter bugs at the LAST chunk block / LAST slot that
+        # a single "first non-None" probe would miss.
+        try:
+            from vllm.v1.personal_context.scatter import _detect_kv_layout
+        except Exception:
+            return
+        for chunk_idx, chunk_assignments in enumerate(
+            req_meta.block_assignments
+        ):
+            if chunk_idx >= len(loaded.chunks):
+                break
+            loaded_chunk = loaded.chunks[chunk_idx]
+            for blk_idx, assignment in enumerate(chunk_assignments):
+                if assignment is None:
+                    continue
+                if blk_idx >= len(loaded_chunk.blocks):
+                    break
+                loaded_block = loaded_chunk.blocks[blk_idx]
+                if loaded_block is None:
+                    continue
+                cache = kv_caches[0]
+                try:
+                    layout = _detect_kv_layout(cache)
+                except Exception:
+                    return
+                if layout == "block_first":
+                    k_block = cache[assignment, 0]
+                else:
+                    k_block = cache[0, assignment]
+                block_size = k_block.shape[0]
+                # Dump slot 0 and slot (block_size-1)
+                for probe_slot in (0, block_size - 1):
+                    k_slot = (
+                        k_block[probe_slot, 0, :].detach().float().cpu()
+                    )
+                    expected_k_head0 = (
+                        loaded_block.keys[0][probe_slot, 0, :]
+                        .detach()
+                        .float()
+                        .cpu()
+                    )
+                    logger.debug(
+                        "PC sparse-Q scatter dump req=%s"
+                        " chunk=%d block=%d slot=%d physical_id=%d"
+                        " layout=%s"
+                        " expected_k_head0[:8]=%s"
+                        " cache_k_head0[:8]=%s"
+                        " abs_diff_sum=%.4e",
+                        req_meta.request_id,
+                        chunk_idx,
+                        blk_idx,
+                        probe_slot,
+                        assignment,
+                        layout,
+                        expected_k_head0[:8].tolist(),
+                        k_slot[:8].tolist(),
+                        (expected_k_head0 - k_slot)
+                        .abs()
+                        .sum()
+                        .item(),
+                    )
 
     def _extract_kv_caches(
         self, forward_context: "ForwardContext | None"
