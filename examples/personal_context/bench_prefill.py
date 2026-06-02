@@ -192,38 +192,81 @@ def _score_generation(
     return float(rouge_l), cos_sim
 
 
+def _median_p10_p90(values: list[float]) -> tuple[float, float, float]:
+    """Return (median, p10, p90) of ``values``.
+
+    Median (not mean) is the headline statistic for TTFT-reduction
+    aggregation: per-instance reduction% is a ratio over instances of
+    different prompt lengths, so a single short-prompt instance can throw
+    an extreme ratio that the mean would chase. The median is robust to
+    that; p10/p90 report the spread so the number is never quoted without
+    its range. Linear-interpolated percentiles via torch.quantile behave
+    sensibly down to small N.
+    """
+    t = torch.tensor(values, dtype=torch.float64)
+    q = torch.quantile(
+        t, torch.tensor([0.10, 0.50, 0.90], dtype=torch.float64)
+    )
+    p10, median, p90 = (float(x) for x in q.tolist())
+    return median, p10, p90
+
+
+# Sentinel key in the ``results`` dict for the vanilla (no-connector)
+# baseline run. Kept distinct from the float r-values so it never collides
+# when the report iterates / sorts the r-values.
+VANILLA_KEY = "vanilla"
+
+
 # ----------------------------- per-r bench loop -----------------------------
 
 
 def _bench_for_r(
-    r: float,
+    r: float | None,
     query_specs: list[QuerySpec],
     sys_padded_tokens: list[int],
     embedder,
     rouge_scorer,
     args: argparse.Namespace,
 ) -> list[Measurement]:
-    """Boot LLM at this r, warmup, run 2-call pattern per query, tear down."""
+    """Boot LLM, warmup, run 2-call pattern per query, tear down.
+
+    ``r`` is the SelectFirstR fraction. Pass ``r=None`` for the **vanilla
+    baseline**: no PersonalContextKVConnector at all, no reuse_plan in the
+    sampling params, so every prompt pays a full vanilla prefill. This is
+    the honest denominator for TTFT-reduction (the alternative, r=1.0,
+    still carries PC's load/scatter/mask overhead even though select-all
+    discards the loaded K — it would understate the reduction).
+
+    FLASHINFER is forced in *both* modes so the vanilla baseline and the
+    sparse-Q runs share the same attention kernel; otherwise a backend
+    speed difference would contaminate the reduction numbers.
+    """
     from vllm import LLM, SamplingParams
     from vllm.config import KVTransferConfig
     from vllm.inputs import TokensPrompt
 
-    extra: dict = {
-        "selector": {"type": "SelectFirstR", "r": r},
-    }
-    if args.store_backend == "redis":
-        extra["store_backend"] = "redis"
-        extra["store_url"] = args.store_url
+    is_vanilla = r is None
+    r_label = "vanilla" if is_vanilla else f"r={r}"
 
-    kv_transfer_config = KVTransferConfig(
-        kv_connector="PersonalContextKVConnector",
-        kv_role="kv_both",
-        kv_connector_extra_config=extra,
-    )
+    # Vanilla baseline boots with no connector; sparse-Q runs attach PC.
+    kv_transfer_config = None
+    if not is_vanilla:
+        extra: dict = {
+            "selector": {"type": "SelectFirstR", "r": r},
+        }
+        if args.store_backend == "redis":
+            extra["store_backend"] = "redis"
+            extra["store_url"] = args.store_url
+        kv_transfer_config = KVTransferConfig(
+            kv_connector="PersonalContextKVConnector",
+            kv_role="kv_both",
+            kv_connector_extra_config=extra,
+        )
 
     print(
         f"\n{'=' * 72}\n"
-        f"[bench] r={r}: booting LLM\n"
+        f"[bench] {r_label}: booting LLM"
+        f"{' (vanilla baseline, no connector)' if is_vanilla else ''}\n"
         f"{'=' * 72}"
     )
     llm = LLM(
@@ -236,11 +279,16 @@ def _bench_for_r(
         attention_config={"backend": "FLASHINFER"},
     )
 
+    # Vanilla passes no reuse_plan; sparse-Q runs pass the connector params.
+    def _sampling(max_tokens: int) -> SamplingParams:
+        kwargs: dict = {"max_tokens": max_tokens, "temperature": 0.0}
+        return kwargs
+
     measurements: list[Measurement] = []
     try:
         # Warmup: sys-only prompt with no reuse_plan, primes vLLM
         # prefix-cache for sys and triggers Triton kernel JIT compile.
-        print(f"[bench] r={r}: warmup (sys-only prompt)")
+        print(f"[bench] {r_label}: warmup (sys-only prompt)")
         llm.generate(
             [TokensPrompt(prompt_token_ids=list(sys_padded_tokens))],
             sampling_params=[
@@ -250,14 +298,14 @@ def _bench_for_r(
 
         for spec in query_specs:
             # ---- Call 1: TTFT on production prompt ----
-            # PC connector activates here; sparse-Q at this r writes
-            # the r-specific chunk K/V into vLLM's paged cache, which
-            # the prefix-cache then captures for Call 2 to consume.
-            sp_ttft = SamplingParams(
-                max_tokens=1,
-                temperature=0.0,
-                extra_args=spec.reuse_params,
-            )
+            # sparse-Q runs: PC connector activates here, scattering the
+            # r-specific chunk K/V into the paged cache (captured by the
+            # prefix-cache for Call 2). Vanilla: plain full prefill, no
+            # reuse_plan, so this is the baseline TTFT.
+            ttft_kwargs = _sampling(1)
+            if not is_vanilla:
+                ttft_kwargs["extra_args"] = spec.reuse_params
+            sp_ttft = SamplingParams(**ttft_kwargs)
             t_start = time.perf_counter()
             _ = llm.generate(
                 [TokensPrompt(prompt_token_ids=list(spec.prod_prompt_ids))],
@@ -269,14 +317,13 @@ def _bench_for_r(
             # ---- Call 2: generation for quality scoring ----
             # Same prompt → vLLM prefix-cache hits the full prefill;
             # this call effectively just decodes 128 tokens against
-            # the r-specific cached K/V from Call 1. PC connector
-            # logs a placement-overflow warning (harmless — there are
-            # 0 new chunk tokens to match here).
-            sp_gen = SamplingParams(
-                max_tokens=args.gen_tokens,
-                temperature=0.0,
-                extra_args=spec.reuse_params,
-            )
+            # the cached K/V from Call 1. (sparse-Q: PC connector logs a
+            # harmless placement-overflow warning — 0 new chunk tokens to
+            # match here.) Vanilla scores quality of a true full prefill.
+            gen_kwargs = _sampling(args.gen_tokens)
+            if not is_vanilla:
+                gen_kwargs["extra_args"] = spec.reuse_params
+            sp_gen = SamplingParams(**gen_kwargs)
             out = llm.generate(
                 [TokensPrompt(prompt_token_ids=list(spec.prod_prompt_ids))],
                 sampling_params=[sp_gen],
@@ -288,7 +335,7 @@ def _bench_for_r(
             )
 
             print(
-                f"[bench] r={r}: {spec.instance_id}: "
+                f"[bench] {r_label}: {spec.instance_id}: "
                 f"TTFT={ttft_ms:7.1f}ms  "
                 f"rougeL={rouge_l:.3f}  cos={cos_sim:.3f}  "
                 f"| {gen_text[:80]!r}{'...' if len(gen_text) > 80 else ''}"
@@ -317,11 +364,16 @@ def _bench_for_r(
 
 
 def _print_report(
-    results: dict[float, list[Measurement]],
+    results: dict,
     query_specs: list[QuerySpec],
 ) -> None:
     """Pretty tables + recovery + raw generation dump."""
-    r_values = sorted(results.keys(), reverse=True)
+    # Separate the vanilla baseline (string key) from the float r-values so
+    # sorting and the quality/recovery tables only ever see numeric r's.
+    has_vanilla = VANILLA_KEY in results
+    r_values = sorted(
+        (k for k in results.keys() if k != VANILLA_KEY), reverse=True
+    )
 
     # ---- Prompt context ----
     print("\n\n" + "=" * 100)
@@ -343,31 +395,74 @@ def _print_report(
 
     header_cells = [f"r={r}" for r in r_values]
 
+    # Column layout for the TTFT table: vanilla baseline first, then each r.
+    ttft_cols = ([VANILLA_KEY] if has_vanilla else []) + r_values
+    ttft_headers = (["vanilla"] if has_vanilla else []) + [
+        f"r={r}" for r in r_values
+    ]
+
     # ---- TTFT table ----
     print("\n" + "-" * 100)
     print(
-        "TTFT (ms) per (r, instance)  — production-shaped prompt "
+        "TTFT (ms) per (column, instance)  — production-shaped prompt "
         "(sys+chunks+query, max_tokens=1)"
     )
     print("-" * 100)
-    print(f"  {'instance':<20}" + "".join(f"{c:>12}" for c in header_cells))
+    print(
+        f"  {'instance':<20}"
+        + "".join(f"{c:>12}" for c in ttft_headers)
+    )
     for i, spec in enumerate(query_specs):
         row = f"  {spec.instance_id:<20}"
-        for r in r_values:
-            row += f"{results[r][i].ttft_ms:>10.1f}  "
+        for k in ttft_cols:
+            row += f"{results[k][i].ttft_ms:>10.1f}  "
         print(row)
-    print(f"  {'AVG':<20}", end="")
-    for r in r_values:
-        avg = sum(m.ttft_ms for m in results[r]) / len(results[r])
-        print(f"{avg:>10.1f}  ", end="")
+    # Median TTFT per column (robust central value, not mean).
+    print(f"  {'MEDIAN':<20}", end="")
+    for k in ttft_cols:
+        med, _, _ = _median_p10_p90([m.ttft_ms for m in results[k]])
+        print(f"{med:>10.1f}  ", end="")
     print()
-    if 1.0 in results:
-        baseline = sum(m.ttft_ms for m in results[1.0]) / len(results[1.0])
-        print(f"  {'Δ vs r=1.0':<20}", end="")
+
+    # ---- TTFT reduction vs vanilla (the headline metric) ----
+    if has_vanilla:
+        vanilla_ms = [m.ttft_ms for m in results[VANILLA_KEY]]
+        print("\n" + "-" * 100)
+        print(
+            "TTFT reduction vs vanilla full prefill  — per-instance "
+            "reduction%, aggregated across instances"
+        )
+        print(
+            "  reduction_i = (ttft_vanilla_i - ttft_r_i) / ttft_vanilla_i ; "
+            "higher = faster. Reported as median [p10-p90]."
+        )
+        print(
+            "  Aggregated per-instance (mean-of-ratios via median), NOT "
+            "ratio-of-means, so long prompts don't dominate."
+        )
+        print("-" * 100)
+        print(
+            f"  {'':<20}" + "".join(f"{f'r={r}':>16}" for r in r_values)
+        )
+        # Per-instance reduction% for each r, then median + p10/p90 over
+        # instances. Skip instances where vanilla TTFT is ~0 (shouldn't
+        # happen, but guards a div-by-zero).
+        print(f"  {'median reduction':<20}", end="")
+        spread: dict[float, tuple[float, float]] = {}
         for r in r_values:
-            avg = sum(m.ttft_ms for m in results[r]) / len(results[r])
-            pct = (avg - baseline) / baseline * 100 if baseline else 0
-            print(f"{pct:>+9.1f}%  ", end="")
+            reds = [
+                (v - m.ttft_ms) / v * 100.0
+                for v, m in zip(vanilla_ms, results[r])
+                if v > 1e-9
+            ]
+            med, p10, p90 = _median_p10_p90(reds)
+            spread[r] = (p10, p90)
+            print(f"{med:>+15.1f}%", end="")
+        print()
+        print(f"  {'  [p10 - p90]':<20}", end="")
+        for r in r_values:
+            p10, p90 = spread[r]
+            print(f"{f'[{p10:+.0f}..{p90:+.0f}]':>16}", end="")
         print()
 
     # ---- ROUGE-L table ----
@@ -399,14 +494,16 @@ def _print_report(
     print("\n" + "=" * 100)
     print("GENERATION DUMP")
     print("=" * 100)
+    dump_cols = ([VANILLA_KEY] if has_vanilla else []) + r_values
     for i, spec in enumerate(query_specs):
         print(f"\n[{spec.instance_id}]")
         print(f"  Query: {spec.query_text}")
         print(f"  Gold:  {spec.gold_text}")
-        for r in r_values:
-            m = results[r][i]
+        for k in dump_cols:
+            m = results[k][i]
+            label = "vanilla" if k == VANILLA_KEY else f"r={k}"
             print(
-                f"\n  r={r}  (rougeL={m.rouge_l:.3f}, cos={m.cos_sim:.3f})"
+                f"\n  {label}  (rougeL={m.rouge_l:.3f}, cos={m.cos_sim:.3f})"
             )
             # Indent the generation for readability.
             for line in m.generated_text.strip().splitlines() or [""]:
@@ -417,8 +514,13 @@ def _print_report(
     print("CAVEATS")
     print("=" * 100)
     print(
-        "1. TTFT numbers rely on per-r LLM teardown to keep PC's K/V scatter\n"
-        "   from leaking through vLLM's prefix cache into later r values."
+        "1. TTFT reduction is measured vs a VANILLA full-prefill baseline\n"
+        "   (no connector), not vs r=1.0 — r=1.0 still pays PC's load/\n"
+        "   scatter/mask overhead, which would understate the reduction.\n"
+        "   Each run (vanilla + every r) tears down its LLM so PC's K/V\n"
+        "   scatter can't leak through the prefix cache into later runs.\n"
+        "   Reduction is aggregated per-instance (median + p10-p90), so\n"
+        "   prompt-length differences don't let long prompts dominate."
     )
     print(
         "2. Perplexity is NOT measured — vLLM's prompt_logprobs disables\n"
@@ -535,7 +637,7 @@ def _print_recovery(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Phase 13 bench: TTFT + generation quality (ROUGE-L, cosine) "
+            "TTFT + generation quality (ROUGE-L, cosine) "
             "+ recovery vs selector_r."
         )
     )
@@ -677,8 +779,18 @@ def main() -> None:
     else:
         outer_ctx = contextlib.nullcontext()
 
-    results: dict[float, list[Measurement]] = {}
+    results: dict = {}
     with outer_ctx:
+        # Vanilla baseline first: no connector, full prefill. This is the
+        # TTFT-reduction denominator (see _bench_for_r docstring).
+        results[VANILLA_KEY] = _bench_for_r(
+            None,
+            query_specs,
+            sys_padded_tokens,
+            embedder,
+            rouge_scorer,
+            args,
+        )
         for r in r_values:
             results[r] = _bench_for_r(
                 r,
