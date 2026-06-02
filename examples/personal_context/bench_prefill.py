@@ -325,23 +325,33 @@ def _bench_for_r(
 
             # ---- Call 2: generation for quality scoring ----
             # Same prompt → vLLM prefix-cache hits the full prefill;
-            # this call effectively just decodes 128 tokens against
-            # the cached K/V from Call 1. (sparse-Q: PC connector logs a
+            # this call effectively just decodes gen_tokens against the
+            # cached K/V from Call 1. (sparse-Q: PC connector logs a
             # harmless placement-overflow warning — 0 new chunk tokens to
-            # match here.) Vanilla scores quality of a true full prefill.
-            gen_kwargs = _sampling(args.gen_tokens)
-            if not is_vanilla:
-                gen_kwargs["extra_args"] = spec.reuse_params
-            sp_gen = SamplingParams(**gen_kwargs)
-            out = llm.generate(
-                [TokensPrompt(prompt_token_ids=list(spec.prod_prompt_ids))],
-                sampling_params=[sp_gen],
-            )
-            gen_text = out[0].outputs[0].text
-
-            rouge_l, cos_sim = _score_generation(
-                spec.gold_text, gen_text, embedder, rouge_scorer
-            )
+            # match here, because Call 1 already prefix-cached the whole
+            # prompt.) Vanilla scores quality of a true full prefill.
+            #
+            # --skip_quality drops Call 2 entirely: it isolates the Call 1
+            # TTFT log (no Call 2 generate, no Call 2 overflow warning) so
+            # you can see exactly whether Call 1's reuse activated. ROUGE/
+            # cosine are reported as NaN in that mode.
+            if args.skip_quality:
+                gen_text = ""
+                rouge_l = float("nan")
+                cos_sim = float("nan")
+            else:
+                gen_kwargs = _sampling(args.gen_tokens)
+                if not is_vanilla:
+                    gen_kwargs["extra_args"] = spec.reuse_params
+                sp_gen = SamplingParams(**gen_kwargs)
+                out = llm.generate(
+                    [TokensPrompt(prompt_token_ids=list(spec.prod_prompt_ids))],
+                    sampling_params=[sp_gen],
+                )
+                gen_text = out[0].outputs[0].text
+                rouge_l, cos_sim = _score_generation(
+                    spec.gold_text, gen_text, embedder, rouge_scorer
+                )
 
             print(
                 f"[bench] {r_label}: {spec.instance_id}: "
@@ -683,6 +693,14 @@ def main() -> None:
         default=DEFAULT_GEN_TOKENS,
         help="Max generation length (Call 2). Should comfortably exceed "
         "gold answer length so ROUGE recall isn't truncated.",
+    )
+    parser.add_argument(
+        "--skip_quality",
+        action="store_true",
+        help="Drop Call 2 (the quality-scoring generation). Leaves only "
+        "the Call 1 TTFT measurement — useful for isolating whether Call "
+        "1's reuse activated, with no Call 2 generate or its harmless "
+        "prefix-cache overflow warning. ROUGE/cosine become NaN.",
     )
     parser.add_argument(
         "--store_backend",
