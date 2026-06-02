@@ -130,25 +130,22 @@ def load_plan(
             import time as _time  # noqa: PLC0415
             _prof = bool(_os.environ.get("VLLM_PC_TIME_ROPE"))
 
-            # K and V together: ONE stack of [2*M, block, nh, hd] (the M
-            # K tensors then the M V tensors) and ONE host→device copy,
-            # instead of stacking + moving K and V separately. This halves
-            # both the CPU stack-copies and the H2D transfers, and the
-            # single larger contiguous transfer uses PCIe bandwidth better
-            # than two smaller ones. After the move, the K half is sliced
-            # off and delta-RoPE'd; the V half (no rotation) is used as-is.
-            m = len(hit_indices) * num_layers
+            # K: stack every (block, layer) of this chunk into one tensor,
+            # move to the compute device, and delta-RoPE the whole stack in
+            # ONE call. All blocks/layers of a chunk shift by the same
+            # ``delta``, so a single batched rotation replaces
+            # ~num_blocks*num_layers per-tensor calls (each of which would
+            # recompute the identical cos/sin and launch its own kernel).
+            # Stores hand back CPU tensors; rotating on CPU was profiled
+            # ~25x slower than GPU and dominated load latency, so when a
+            # ``device`` is given we move K there first (the H2D is ~1ms)
+            # and the downstream scatter becomes a GPU→GPU copy.
             if _prof:
                 torch.cuda.synchronize() if torch.cuda.is_available() else None
                 _ts = _time.perf_counter()
-            kv_stacked = torch.stack(
+            stacked = torch.stack(
                 [
                     chunk_lookup.blocks[i].block.keys[layer]
-                    for i in hit_indices
-                    for layer in range(num_layers)
-                ]
-                + [
-                    chunk_lookup.blocks[i].block.values[layer]
                     for i in hit_indices
                     for layer in range(num_layers)
                 ],
@@ -156,32 +153,21 @@ def load_plan(
             )
             if _prof:
                 _t_stack = _time.perf_counter() - _ts
-            # Single combined H2D copy for K+V. Stores hand back CPU
-            # tensors; rotating K on CPU was profiled ~25x slower than GPU
-            # and dominated load latency, so when a ``device`` is given we
-            # move the whole K+V stack there once (the H2D is ~1ms) and the
-            # downstream scatter becomes a GPU→GPU copy.
-            # ---- PROD-PATH profiling (VLLM_PC_TIME_ROPE=1): k_move now
-            # times the combined K+V H2D; v_move is folded in (stays ~0).
             if _prof and device is not None:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 _ts2 = _time.perf_counter()
             if device is not None:
-                kv_stacked = kv_stacked.to(device)
-            else:
-                kv_stacked = kv_stacked.clone()
+                stacked = stacked.to(device)
             if _prof and device is not None:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 _PROF_ACC["k_move"] += _time.perf_counter() - _ts2
                 _PROF_ACC["stack"] += _t_stack
                 _ts2 = _time.perf_counter()
-            # K half: rotate; V half: leave as-is.
             rotated = apply_delta_rope_batched(
-                kv_stacked[:m], delta, rope_theta=rope_theta
+                stacked, delta, rope_theta=rope_theta
             )
-            v_moved = kv_stacked[m:]
             if _prof and device is not None:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -191,8 +177,36 @@ def load_plan(
                 rotated_per_block[i] = [
                     rotated[base + layer] for layer in range(num_layers)
                 ]
+
+            # V needs no rotation, but it MUST be moved to ``device`` the
+            # same batched way as K: doing it per (block, layer) was
+            # ~num_blocks*num_layers tiny H2D copies whose launch+latency
+            # overhead dominated load_plan (profiled ~100ms vs ~24ms once
+            # batched). Stack all V, move once, then unstack.
+            if _prof and device is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _ts2 = _time.perf_counter()
+            v_stacked = torch.stack(
+                [
+                    chunk_lookup.blocks[i].block.values[layer]
+                    for i in hit_indices
+                    for layer in range(num_layers)
+                ],
+                dim=0,
+            )
+            if device is not None:
+                v_stacked = v_stacked.to(device)
+            else:
+                v_stacked = v_stacked.clone()
+            if _prof and device is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _PROF_ACC["v_move"] += _time.perf_counter() - _ts2
+            for slot, i in enumerate(hit_indices):
+                base = slot * num_layers
                 values_per_block[i] = [
-                    v_moved[base + layer] for layer in range(num_layers)
+                    v_stacked[base + layer] for layer in range(num_layers)
                 ]
 
         loaded_blocks: list[LoadedBlock | None] = []
