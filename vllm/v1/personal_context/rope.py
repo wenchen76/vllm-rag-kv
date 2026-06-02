@@ -111,3 +111,56 @@ def apply_delta_rope(
         (block_size,), delta, dtype=torch.float32, device=keys.device
     )
     return apply_rope_at_positions(keys, positions, rope_theta=rope_theta)
+
+
+def apply_delta_rope_batched(
+    keys: torch.Tensor,
+    delta: int,
+    rope_theta: float = 10000.0,
+) -> torch.Tensor:
+    """Batched ``apply_delta_rope`` over a leading stack dimension.
+
+    ``keys`` has shape ``[M, block_size, num_kv_heads, head_dim]`` — a
+    stack of ``M`` blocks (e.g. every (block, layer) pair of one chunk)
+    that all shift by the SAME ``delta``. Because the rotation depends
+    only on ``delta`` (constant within a chunk), the cos/sin table is
+    computed ONCE and broadcast across the whole stack, replacing ``M``
+    separate ``apply_delta_rope`` calls — each of which otherwise
+    recomputes the identical inv_freq + cos/sin and launches its own
+    kernels. This is the hot path in ``load_plan`` for long contexts:
+    14 chunks x ~4 blocks x 32 layers is ~1800 calls collapsed to a
+    handful.
+
+    Numerically identical to calling ``apply_delta_rope`` on each
+    ``keys[i]`` (same fp32 compute, same cos/sin, same rotate-half).
+
+    Returns a tensor of the same shape and dtype as ``keys``; input is
+    not mutated. ``M == 0`` returns an empty tensor of the right shape.
+    """
+    if keys.dim() != 4:
+        raise ValueError(
+            f"keys must be 4-D [M, block_size, num_kv_heads, head_dim], "
+            f"got shape {tuple(keys.shape)}"
+        )
+    head_dim = keys.shape[-1]
+    if head_dim % 2 != 0:
+        raise ValueError(f"head_dim must be even, got {head_dim}")
+    if keys.shape[0] == 0:
+        return keys.clone()
+
+    block_size = keys.shape[1]
+    orig_dtype = keys.dtype
+    x_fp32 = keys.to(torch.float32)
+    inv_freq = _compute_inv_freq(head_dim, rope_theta, keys.device)
+    positions = torch.full(
+        (block_size,), delta, dtype=torch.float32, device=keys.device
+    )
+    cos, sin = _compute_cos_sin(positions, inv_freq)  # [block_size, head_dim]
+    # Broadcast cos/sin over the leading stack dim (M) and the head dim:
+    # x_fp32 is [M, block_size, num_kv_heads, head_dim], cos/sin become
+    # [1, block_size, 1, head_dim].
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+
+    rotated = x_fp32 * cos + _rotate_half(x_fp32) * sin
+    return rotated.to(orig_dtype)

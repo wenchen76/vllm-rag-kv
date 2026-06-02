@@ -36,6 +36,7 @@ from vllm.v1.personal_context.prefill import (
 )
 from vllm.v1.personal_context.rope import (
     apply_delta_rope,
+    apply_delta_rope_batched,
     apply_rope_at_positions,
 )
 from vllm.v1.personal_context.scatter import (
@@ -73,6 +74,7 @@ __all__ = [
     "Selector",
     "StoreConfig",
     "apply_delta_rope",
+    "apply_delta_rope_batched",
     "apply_rope_at_positions",
     "assert_can_write_prefix_cache",
     "build_chunk_aware_mask",

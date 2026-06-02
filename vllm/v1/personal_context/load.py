@@ -19,7 +19,7 @@ import torch
 
 from vllm.v1.personal_context.chunk import Chunk, validate_chunk_alignment
 from vllm.v1.personal_context.connector import PlanLookup
-from vllm.v1.personal_context.rope import apply_delta_rope
+from vllm.v1.personal_context.rope import apply_delta_rope_batched
 
 
 @dataclass(frozen=True)
@@ -87,20 +87,48 @@ def load_plan(
         validate_chunk_alignment(new_pos, len(chunk.token_ids), block_size)
         delta = new_pos - chunk.old_pos_start
 
+        # All (block, layer) K tensors of this chunk shift by the same
+        # ``delta``, so rotate them in ONE batched call instead of one
+        # apply_delta_rope per (block, layer) — the latter recomputes the
+        # identical cos/sin and launches a kernel ~num_blocks*num_layers
+        # times, which dominated load latency for long contexts. Gather
+        # every hit block's K stack, rotate once, then scatter back.
+        hit_indices = [
+            i for i, bl in enumerate(chunk_lookup.blocks)
+            if bl.block is not None
+        ]
+        rotated_per_block: dict[int, list] = {}
+        if hit_indices:
+            num_layers = len(chunk_lookup.blocks[hit_indices[0]].block.keys)
+            # Stack: [num_hit_blocks * num_layers, block_size, nh, hd],
+            # block-major then layer (so we can slice it back per block).
+            stacked = torch.stack(
+                [
+                    chunk_lookup.blocks[i].block.keys[layer]
+                    for i in hit_indices
+                    for layer in range(num_layers)
+                ],
+                dim=0,
+            )
+            rotated = apply_delta_rope_batched(
+                stacked, delta, rope_theta=rope_theta
+            )
+            for slot, i in enumerate(hit_indices):
+                base = slot * num_layers
+                rotated_per_block[i] = [
+                    rotated[base + layer] for layer in range(num_layers)
+                ]
+
         loaded_blocks: list[LoadedBlock | None] = []
         for i, bl in enumerate(chunk_lookup.blocks):
             if bl.block is None:
                 loaded_blocks.append(None)
                 continue
             block_new_pos = new_pos + i * block_size
-            rotated_keys = [
-                apply_delta_rope(k, delta, rope_theta=rope_theta)
-                for k in bl.block.keys
-            ]
             cloned_values = [v.clone() for v in bl.block.values]
             loaded_blocks.append(
                 LoadedBlock(
-                    keys=rotated_keys,
+                    keys=rotated_per_block[i],
                     values=cloned_values,
                     new_pos_start=block_new_pos,
                 )
