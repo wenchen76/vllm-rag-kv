@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -894,9 +895,28 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
             )
             return
 
+        # Optional per-phase timing to attribute start_load_kv latency
+        # across lookup / load_plan (delta-RoPE) / scatter. GPU work is
+        # async, so each phase is wrapped in cuda.synchronize() to measure
+        # actual execution, not just kernel-launch time. Accumulated across
+        # all requests and printed once at the end. Enable with
+        # VLLM_PC_TIME_LOAD=1.
+        _time_load = bool(os.environ.get("VLLM_PC_TIME_LOAD"))
+        _t = {"lookup": 0.0, "load_plan": 0.0, "scatter": 0.0}
+
+        def _sync():
+            if _time_load and torch.cuda.is_available():
+                torch.cuda.synchronize()
+
         for req_meta in metadata.requests:
             try:
+                if _time_load:
+                    _sync()
+                    _t0 = time.perf_counter()
                 lookup_result = self._lookup.lookup(req_meta.plan)
+                if _time_load:
+                    _sync()
+                    _t["lookup"] += time.perf_counter() - _t0
             except AlignmentError as e:
                 logger.warning(
                     "Request %s: alignment error during worker-side "
@@ -942,18 +962,39 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
                             req_meta.new_pos_starts,
                             self._rope_theta,
                         )
+            if _time_load:
+                _sync()
+                _t0 = time.perf_counter()
             loaded = load_plan(
                 lookup_result,
                 req_meta.new_pos_starts,
                 rope_theta=self._rope_theta,
             )
+            if _time_load:
+                _sync()
+                _t["load_plan"] += time.perf_counter() - _t0
+                _t0 = time.perf_counter()
             scatter_loaded_plan(
                 loaded, kv_caches, req_meta.block_assignments
             )
+            if _time_load:
+                _sync()
+                _t["scatter"] += time.perf_counter() - _t0
             if os.environ.get("VLLM_PC_DEBUG_SPARSE_Q"):
                 self._debug_dump_scattered_slots(
                     req_meta, kv_caches, loaded
                 )
+
+        if _time_load:
+            logger.info(
+                "PC start_load_kv timing (%d req): lookup=%.1fms "
+                "load_plan/delta-RoPE=%.1fms scatter=%.1fms total=%.1fms",
+                len(metadata.requests),
+                _t["lookup"] * 1000.0,
+                _t["load_plan"] * 1000.0,
+                _t["scatter"] * 1000.0,
+                (_t["lookup"] + _t["load_plan"] + _t["scatter"]) * 1000.0,
+            )
 
     def _debug_dump_scattered_slots(
         self,
