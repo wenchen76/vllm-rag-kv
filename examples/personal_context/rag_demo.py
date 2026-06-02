@@ -88,6 +88,18 @@ from vllm.v1.personal_context import Chunk, InMemoryStorage  # noqa: E402
 DEFAULT_DATA_PATH = Path(__file__).parent / "sample_data.jsonl"
 DEFAULT_EMBEDDER = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_REDIS_URL = "redis://localhost:6379"
+DEFAULT_MMAP_DIR = "/tmp/pc_mmap"
+
+
+def _default_store_url(backend: str) -> str:
+    """Per-backend default for ``--store_url`` (resolved when the flag is
+    omitted): a redis:// URL for redis, an on-disk directory for mmap.
+    Returns "" for memory (the value is ignored there)."""
+    if backend == "redis":
+        return DEFAULT_REDIS_URL
+    if backend == "mmap":
+        return DEFAULT_MMAP_DIR
+    return ""
 
 
 # ----------------------- index entry -----------------------
@@ -122,8 +134,8 @@ def _build_kv_store(preset, block_size: int, backend: str, url: str):
     ``kv_connector_extra_config`` (see ``_maybe_init_storage_from_config``
     in the connector). For the writes from the encoder process to be
     visible to the worker, both sides must point at the same backing
-    store; for ``redis`` that's the Redis URL, for ``memory`` it's the
-    pickle bridge.
+    store; for ``redis`` that's the Redis URL, for ``mmap`` it's the
+    on-disk directory (``url``), for ``memory`` it's the pickle bridge.
     """
     cfg = store_config_for(preset, block_size=block_size)
     if backend == "memory":
@@ -133,8 +145,14 @@ def _build_kv_store(preset, block_size: int, backend: str, url: str):
 
         print(f"[index] connecting to Redis at {url}")
         return RedisKVStorage(cfg, url=url)
+    if backend == "mmap":
+        from vllm.v1.personal_context.mmap_storage import MmapKVStorage
+
+        print(f"[index] opening mmap store at {url}")
+        return MmapKVStorage(cfg, root_dir=url)
     raise ValueError(
-        f"unknown store_backend {backend!r}; must be 'memory' or 'redis'"
+        f"unknown store_backend {backend!r}; must be 'memory', 'redis', "
+        "or 'mmap'"
     )
 
 
@@ -558,22 +576,29 @@ def main() -> None:
     parser.add_argument(
         "--store_backend",
         type=str,
-        default="memory",
-        choices=["memory", "redis"],
+        default="mmap",
+        choices=["memory", "redis", "mmap"],
         help=(
-            "KV store backend. 'memory' = process-local InMemoryStorage "
-            "bridged to the vLLM worker via pickle (test path, default). "
-            "'redis' = RedisKVStorage shared with the worker via "
-            "kv_connector_extra_config; requires a running Redis instance "
-            "(e.g. `docker run -d -p 6379:6379 redis/redis-stack-server`)."
+            "KV store backend (default: mmap). 'mmap' = MmapKVStorage, a "
+            "same-host on-disk store the worker shares with no "
+            "serialisation/socket overhead (--store_url is the directory, "
+            f"default {DEFAULT_MMAP_DIR}). 'memory' = process-local "
+            "InMemoryStorage bridged to the worker via pickle (test path). "
+            "'redis' = RedisKVStorage shared via kv_connector_extra_config; "
+            "requires a running Redis instance (e.g. `docker run -d -p "
+            "6379:6379 redis/redis-stack-server`)."
         ),
     )
     parser.add_argument(
         "--store_url",
         type=str,
-        default=DEFAULT_REDIS_URL,
+        default=None,
         help=(
-            "Redis URL when --store_backend=redis. Ignored for memory."
+            "Backing-store location: a redis:// URL when "
+            "--store_backend=redis, or a filesystem directory when "
+            "--store_backend=mmap. Ignored for memory. When omitted, "
+            f"defaults per backend (redis: {DEFAULT_REDIS_URL}, mmap: "
+            f"{DEFAULT_MMAP_DIR})."
         ),
     )
     parser.add_argument(
@@ -588,6 +613,11 @@ def main() -> None:
         ),
     )
     args = parser.parse_args()
+
+    # Resolve the per-backend default store_url when the flag was omitted,
+    # so `--store_backend mmap` alone doesn't inherit the redis URL.
+    if args.store_url is None:
+        args.store_url = _default_store_url(args.store_backend)
 
     # 1. Load JSONL.
     with open(args.data, encoding="utf-8") as f:
@@ -633,6 +663,8 @@ def main() -> None:
     #               (storage object travels in a tempfile)
     #      redis  → kv_connector_extra_config carries backend + URL;
     #               worker builds its own RedisKVStorage. No pickle.
+    #      mmap   → same as redis but store_url is the on-disk dir; worker
+    #               builds its own MmapKVStorage over the same directory.
     from vllm import LLM, SamplingParams
     from vllm.config import KVTransferConfig
     from vllm.inputs import TokensPrompt
@@ -640,8 +672,8 @@ def main() -> None:
     extra: dict = {
         "selector": {"type": "SelectFirstR", "r": args.selector_r},
     }
-    if args.store_backend == "redis":
-        extra["store_backend"] = "redis"
+    if args.store_backend in ("redis", "mmap"):
+        extra["store_backend"] = args.store_backend
         extra["store_url"] = args.store_url
 
     kv_transfer_config = KVTransferConfig(

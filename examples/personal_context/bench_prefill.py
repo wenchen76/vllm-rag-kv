@@ -89,8 +89,10 @@ from examples.personal_context.chunk_encoder_hf import (  # noqa: E402
 from examples.personal_context.rag_demo import (  # noqa: E402
     DEFAULT_DATA_PATH,
     DEFAULT_EMBEDDER,
+    DEFAULT_MMAP_DIR,
     DEFAULT_REDIS_URL,
     RAGIndex,
+    _default_store_url,
     _pad_tokens_to_block_size,
     _pc_test_bind_storage,
     build_prompt_and_plan,
@@ -254,8 +256,11 @@ def _bench_for_r(
         extra: dict = {
             "selector": {"type": "SelectFirstR", "r": r},
         }
-        if args.store_backend == "redis":
-            extra["store_backend"] = "redis"
+        # redis + mmap both let the worker build its own storage from the
+        # connector config (pointing at the same Redis URL / mmap dir as
+        # the encoder). memory uses the pickle bridge instead.
+        if args.store_backend in ("redis", "mmap"):
+            extra["store_backend"] = args.store_backend
             extra["store_url"] = args.store_url
         kv_transfer_config = KVTransferConfig(
             kv_connector="PersonalContextKVConnector",
@@ -678,18 +683,26 @@ def main() -> None:
     parser.add_argument(
         "--store_backend",
         type=str,
-        default="redis",
-        choices=["memory", "redis"],
+        default="mmap",
+        choices=["memory", "redis", "mmap"],
         help=(
-            "PC store backend. 'redis' is recommended so the encoder "
-            "runs only once and all r values share warm cache."
+            "PC store backend (default: mmap). 'redis' / 'mmap' let the "
+            "encoder run once and the worker share the same store across "
+            "all r values; 'mmap' is the fastest cross-process backend on "
+            "a single host (no serialisation, no socket)."
         ),
     )
     parser.add_argument(
         "--store_url",
         type=str,
-        default=DEFAULT_REDIS_URL,
-        help="Redis URL when --store_backend=redis.",
+        default=None,
+        help=(
+            "Backing-store location: a redis:// URL when "
+            "--store_backend=redis, or a filesystem directory when "
+            "--store_backend=mmap. Ignored for memory. When omitted, "
+            f"defaults per backend (redis: {DEFAULT_REDIS_URL}, mmap: "
+            f"{DEFAULT_MMAP_DIR})."
+        ),
     )
     parser.add_argument(
         "--embedder",
@@ -710,6 +723,11 @@ def main() -> None:
         help="vLLM gpu_memory_utilization (each LLM boot).",
     )
     args = parser.parse_args()
+
+    # Resolve the per-backend default store_url when omitted, so
+    # `--store_backend mmap` alone doesn't inherit the redis URL.
+    if args.store_url is None:
+        args.store_url = _default_store_url(args.store_backend)
 
     r_values = [float(x) for x in args.r_values.split(",") if x.strip()]
     if not r_values:

@@ -47,6 +47,7 @@ from vllm.v1.personal_context.selection import (
     SelectFirstR,
     Selector,
 )
+from vllm.v1.personal_context.mmap_storage import MmapKVStorage
 from vllm.v1.personal_context.redis_storage import RedisKVStorage
 from vllm.v1.personal_context.storage import InMemoryStorage, validate_block
 
@@ -60,6 +61,7 @@ __all__ = [
     "LoadedBlock",
     "LoadedChunk",
     "LoadedPlan",
+    "MmapKVStorage",
     "NoSelection",
     "PersonalContextConnector",
     "PlanLookup",

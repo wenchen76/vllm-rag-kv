@@ -360,17 +360,21 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
             ``"redis"`` → build ``RedisKVStorage`` against
                 ``store_url`` and bind it. Schema is auto-verified
                 against any existing ``pc:config`` key in Redis.
+            ``"mmap"`` → build ``MmapKVStorage`` rooted at the directory
+                given by ``store_url`` (a filesystem path) and bind it.
+                Same-host persistent + zero-copy backend; schema is
+                auto-verified against the directory's existing index.
 
-        Unknown backends log and stay unbound. ``RedisKVStorage`` init
-        failures (server unreachable, schema mismatch, etc.) also log
-        and stay unbound — the connector then behaves as if no storage
-        is configured, i.e. all requests fall back to full prefill.
+        Unknown backends log and stay unbound. Backend init failures
+        (server unreachable, schema mismatch, etc.) also log and stay
+        unbound — the connector then behaves as if no storage is
+        configured, i.e. all requests fall back to full prefill.
         """
         extra = self._kv_transfer_config.kv_connector_extra_config or {}
         backend = extra.get("store_backend")
         if backend is None or backend == "memory":
             return
-        if backend != "redis":
+        if backend not in ("redis", "mmap"):
             logger.warning(
                 "PersonalContextKVConnector: unknown store_backend %r; "
                 "staying unbound (request will fall back to full prefill).",
@@ -378,11 +382,14 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
             )
             return
 
+        # Both redis and mmap take their location from ``store_url``
+        # (a redis:// URL, or a filesystem directory path respectively).
         url = extra.get("store_url")
         if not url:
             logger.warning(
-                "PersonalContextKVConnector: store_backend='redis' but "
-                "store_url is missing or empty; staying unbound."
+                "PersonalContextKVConnector: store_backend=%r but store_url "
+                "is missing or empty; staying unbound.",
+                backend,
             )
             return
 
@@ -396,13 +403,23 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
             return
 
         try:
-            from vllm.v1.personal_context.redis_storage import RedisKVStorage
+            if backend == "redis":
+                from vllm.v1.personal_context.redis_storage import (
+                    RedisKVStorage,
+                )
 
-            storage = RedisKVStorage(store_config, url=url)
+                storage = RedisKVStorage(store_config, url=url)
+            else:  # mmap
+                from vllm.v1.personal_context.mmap_storage import (
+                    MmapKVStorage,
+                )
+
+                storage = MmapKVStorage(store_config, root_dir=url)
         except Exception:
             logger.exception(
-                "PersonalContextKVConnector: RedisKVStorage init failed "
-                "(url=%s); staying unbound.",
+                "PersonalContextKVConnector: %s storage init failed "
+                "(store_url=%s); staying unbound.",
+                backend,
                 url,
             )
             return
@@ -412,13 +429,15 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
         except Exception:
             logger.exception(
                 "PersonalContextKVConnector: bind_storage failed for "
-                "RedisKVStorage; staying unbound."
+                "%s storage; staying unbound.",
+                backend,
             )
             return
 
         logger.info(
-            "PersonalContextKVConnector: storage backend=redis bound "
-            "(url=%s, %d blocks visible).",
+            "PersonalContextKVConnector: storage backend=%s bound "
+            "(store_url=%s, %d blocks visible).",
+            backend,
             url,
             len(storage),
         )
