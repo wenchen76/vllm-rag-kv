@@ -119,6 +119,7 @@ def load_plan(
             if bl.block is not None
         ]
         rotated_per_block: dict[int, list] = {}
+        values_per_block: dict[int, list] = {}
         if hit_indices:
             num_layers = len(chunk_lookup.blocks[hit_indices[0]].block.keys)
             # ---- TEMP instrumentation: VLLM_PC_TIME_ROPE=1 splits the
@@ -207,25 +208,44 @@ def load_plan(
                     rotated[base + layer] for layer in range(num_layers)
                 ]
 
-        import os as _os2  # noqa: PLC0415
-        import time as _time2  # noqa: PLC0415
-        _prof_v = bool(_os2.environ.get("VLLM_PC_TIME_ROPE")) and device is not None
-        if _prof_v and torch.cuda.is_available():
-            torch.cuda.synchronize()
-        _tsv = _time2.perf_counter() if _prof_v else 0.0
+            # V needs no rotation, but it MUST be moved to the device the
+            # same batched way as K: doing it per (block, layer) was
+            # ~1800 tiny H2D copies whose launch+latency overhead dominated
+            # load_plan (~100ms vs ~9ms for K's single batched move). Stack
+            # all V, move once, then unstack to mirror rotated_per_block.
+            if _prof and device is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _ts2 = _time.perf_counter()
+            v_stacked = torch.stack(
+                [
+                    chunk_lookup.blocks[i].block.values[layer]
+                    for i in hit_indices
+                    for layer in range(num_layers)
+                ],
+                dim=0,
+            )
+            if device is not None:
+                v_stacked = v_stacked.to(device)
+            else:
+                v_stacked = v_stacked.clone()
+            if _prof and device is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _PROF_ACC["v_move"] += _time.perf_counter() - _ts2
+            for slot, i in enumerate(hit_indices):
+                base = slot * num_layers
+                values_per_block[i] = [
+                    v_stacked[base + layer] for layer in range(num_layers)
+                ]
+
         loaded_blocks: list[LoadedBlock | None] = []
         for i, bl in enumerate(chunk_lookup.blocks):
             if bl.block is None:
                 loaded_blocks.append(None)
                 continue
             block_new_pos = new_pos + i * block_size
-            # V is position-independent (no rotation) but still moved to
-            # the target device so the downstream scatter is a GPU→GPU
-            # copy rather than a per-block host→device transfer.
-            cloned_values = [
-                (v.to(device) if device is not None else v.clone())
-                for v in bl.block.values
-            ]
+            cloned_values = values_per_block[i]
             loaded_blocks.append(
                 LoadedBlock(
                     keys=rotated_per_block[i],
@@ -233,10 +253,6 @@ def load_plan(
                     new_pos_start=block_new_pos,
                 )
             )
-        if _prof_v:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            _PROF_ACC["v_move"] += _time2.perf_counter() - _tsv
         loaded_chunks.append(
             LoadedChunk(
                 chunk=chunk,
