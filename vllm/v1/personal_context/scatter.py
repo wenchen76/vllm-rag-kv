@@ -47,11 +47,18 @@ leave the paged cache in a half-written state.
 
 from __future__ import annotations
 
+import os
+import time
 from typing import Sequence
 
 import torch
 
 from vllm.v1.personal_context.load import LoadedBlock, LoadedPlan
+
+# TEMP profiling accumulator for scatter phase timing
+# (VLLM_PC_TIME_SCATTER=1): validate / detect-layout / copy totals across
+# one scatter_loaded_plan call. Reset per call. Remove after.
+_SCATTER_PROF: dict = {"validate": 0.0, "copy": 0.0}
 
 
 def _detect_kv_layout(cache: torch.Tensor) -> str:
@@ -170,6 +177,14 @@ def scatter_loaded_plan(
             f"block_assignments has {len(block_assignments)} entries, "
             f"loaded_plan has {len(loaded_plan.chunks)} chunks"
         )
+    # TEMP profiling (VLLM_PC_TIME_SCATTER=1): split validate vs copy to
+    # attribute scatter latency. GPU copies are async so the copy phase is
+    # synced before timing. Remove with the instrumentation.
+    _prof = bool(os.environ.get("VLLM_PC_TIME_SCATTER"))
+    if _prof:
+        _SCATTER_PROF["validate"] = 0.0
+        _SCATTER_PROF["copy"] = 0.0
+        _t0 = time.perf_counter()
     for chunk_idx, (loaded_chunk, chunk_assignments) in enumerate(
         zip(loaded_plan.chunks, block_assignments)
     ):
@@ -185,6 +200,11 @@ def scatter_loaded_plan(
             if loaded_block is None or assignment is None:
                 continue
             _validate_block(loaded_block, kv_caches, assignment)
+    if _prof:
+        _SCATTER_PROF["validate"] = time.perf_counter() - _t0
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _t0 = time.perf_counter()
 
     for loaded_chunk, chunk_assignments in zip(
         loaded_plan.chunks, block_assignments
@@ -200,6 +220,16 @@ def scatter_loaded_plan(
                 _write_kv_to_cache(
                     cache, _detect_kv_layout(cache), assignment, k, v
                 )
+    if _prof:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _SCATTER_PROF["copy"] = time.perf_counter() - _t0
+        import logging  # noqa: PLC0415
+        logging.getLogger(__name__).info(
+            "PC scatter prof: validate=%.1fms copy=%.1fms",
+            _SCATTER_PROF["validate"] * 1000,
+            _SCATTER_PROF["copy"] * 1000,
+        )
 
 
 def _validate_block(
