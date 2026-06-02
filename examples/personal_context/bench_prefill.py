@@ -100,7 +100,11 @@ from examples.personal_context.rag_demo import (  # noqa: E402
 
 
 DEFAULT_R_VALUES = "1.0,0.75,0.5,0.25,0.0"
-DEFAULT_GEN_TOKENS = 128
+# 160 (not 128): gold answers run ~50-70 tok, but the sys prompt now asks
+# for all details (dates/times/amounts/names/locations), so completions are
+# a bit longer; 160 keeps the few longest answers from being length-capped
+# without materially slowing Call 2.
+DEFAULT_GEN_TOKENS = 160
 
 
 # ----------------------------- data classes -----------------------------

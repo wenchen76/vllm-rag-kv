@@ -564,8 +564,9 @@ def main() -> None:
     parser.add_argument(
         "--max_tokens",
         type=int,
-        default=128,
-        help="Max tokens generated per query.",
+        default=160,
+        help="Max tokens generated per query (160: the sys prompt asks for "
+        "all details, so answers run a little longer than the ~70-tok gold).",
     )
     parser.add_argument(
         "--embedder",
