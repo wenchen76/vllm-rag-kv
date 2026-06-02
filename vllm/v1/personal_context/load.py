@@ -21,6 +21,10 @@ from vllm.v1.personal_context.chunk import Chunk, validate_chunk_alignment
 from vllm.v1.personal_context.connector import PlanLookup
 from vllm.v1.personal_context.rope import apply_delta_rope_batched
 
+# TEMP profiling accumulator for load_plan phase timing (VLLM_PC_TIME_ROPE).
+# Reset per load_plan call. Remove with the rest of the instrumentation.
+_PROF_ACC: dict = {"stack": 0.0, "k_move": 0.0, "rotate": 0.0, "v_move": 0.0}
+
 
 @dataclass(frozen=True)
 class LoadedBlock:
@@ -88,6 +92,12 @@ def load_plan(
             f"new_pos_starts has {len(new_pos_starts)} entries but plan "
             f"has {len(plan_lookup.chunks)} chunks"
         )
+
+    # TEMP profiling accumulator (VLLM_PC_TIME_ROPE=1): per-phase totals
+    # across all chunks of this plan, to attribute load_plan's residual
+    # latency. Reset each call. Remove with the rest of the instrumentation.
+    global _PROF_ACC
+    _PROF_ACC = {"stack": 0.0, "k_move": 0.0, "rotate": 0.0, "v_move": 0.0}
 
     block_size = plan_lookup.block_size
     loaded_chunks: list[LoadedChunk] = []
@@ -168,17 +178,41 @@ def load_plan(
             # delta-RoPE runs on GPU — profiled ~25x faster than on CPU,
             # with the host→device copy itself only ~1 ms. ``None`` device
             # keeps it on CPU (prior behaviour).
+            # ---- PROD-PATH profiling (VLLM_PC_TIME_ROPE=1): accumulate
+            # stack / K-move-H2D / rotate across all chunks of this plan so
+            # we can attribute load_plan's residual ~130ms. _PROF_ACC is a
+            # module-global reset per load_plan call.
+            if _prof and device is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _ts2 = _time.perf_counter()
             if device is not None:
                 stacked = stacked.to(device)
+            if _prof and device is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _PROF_ACC["k_move"] += _time.perf_counter() - _ts2
+                _PROF_ACC["stack"] += _t_stack
+                _ts2 = _time.perf_counter()
             rotated = apply_delta_rope_batched(
                 stacked, delta, rope_theta=rope_theta
             )
+            if _prof and device is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _PROF_ACC["rotate"] += _time.perf_counter() - _ts2
             for slot, i in enumerate(hit_indices):
                 base = slot * num_layers
                 rotated_per_block[i] = [
                     rotated[base + layer] for layer in range(num_layers)
                 ]
 
+        import os as _os2  # noqa: PLC0415
+        import time as _time2  # noqa: PLC0415
+        _prof_v = bool(_os2.environ.get("VLLM_PC_TIME_ROPE")) and device is not None
+        if _prof_v and torch.cuda.is_available():
+            torch.cuda.synchronize()
+        _tsv = _time2.perf_counter() if _prof_v else 0.0
         loaded_blocks: list[LoadedBlock | None] = []
         for i, bl in enumerate(chunk_lookup.blocks):
             if bl.block is None:
@@ -199,12 +233,27 @@ def load_plan(
                     new_pos_start=block_new_pos,
                 )
             )
+        if _prof_v:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _PROF_ACC["v_move"] += _time2.perf_counter() - _tsv
         loaded_chunks.append(
             LoadedChunk(
                 chunk=chunk,
                 new_pos_start=new_pos,
                 blocks=tuple(loaded_blocks),
             )
+        )
+
+    import os as _os3  # noqa: PLC0415
+    if _os3.environ.get("VLLM_PC_TIME_ROPE") and device is not None:
+        import logging as _lg3  # noqa: PLC0415
+        _lg3.getLogger(__name__).info(
+            "PC load_plan prod-path (%d chunks): stack=%.1fms "
+            "k_move_h2d=%.1fms rotate=%.1fms v_move_h2d=%.1fms",
+            len(plan_lookup.chunks),
+            _PROF_ACC["stack"] * 1000, _PROF_ACC["k_move"] * 1000,
+            _PROF_ACC["rotate"] * 1000, _PROF_ACC["v_move"] * 1000,
         )
 
     return LoadedPlan(chunks=tuple(loaded_chunks))
