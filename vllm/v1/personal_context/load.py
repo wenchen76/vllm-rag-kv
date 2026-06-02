@@ -156,36 +156,6 @@ def load_plan(
             )
             if _prof:
                 _t_stack = _time.perf_counter() - _ts
-                # (a) rotate on the tensor's native device (CPU for mmap).
-                torch.cuda.synchronize() if torch.cuda.is_available() else None
-                _ts = _time.perf_counter()
-                _ = apply_delta_rope_batched(
-                    kv_stacked[:m], delta, rope_theta=rope_theta
-                )
-                _t_cpu = _time.perf_counter() - _ts
-                # (b) move to GPU then rotate on GPU.
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    _ts = _time.perf_counter()
-                    _g = kv_stacked[:m].to("cuda")
-                    torch.cuda.synchronize()
-                    _t_move = _time.perf_counter() - _ts
-                    _ts = _time.perf_counter()
-                    _ = apply_delta_rope_batched(
-                        _g, delta, rope_theta=rope_theta
-                    )
-                    torch.cuda.synchronize()
-                    _t_gpu = _time.perf_counter() - _ts
-                else:
-                    _t_move = _t_gpu = float("nan")
-                import logging as _lg  # noqa: PLC0415
-                _lg.getLogger(__name__).info(
-                    "PC rope-prof (M=%d): stack=%.1fms cpu_rotate=%.1fms "
-                    "move_gpu=%.1fms gpu_rotate=%.1fms",
-                    m,
-                    _t_stack * 1000, _t_cpu * 1000,
-                    _t_move * 1000, _t_gpu * 1000,
-                )
             # Single combined H2D copy for K+V. Stores hand back CPU
             # tensors; rotating K on CPU was profiled ~25x slower than GPU
             # and dominated load latency, so when a ``device`` is given we
