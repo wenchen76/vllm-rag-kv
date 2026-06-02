@@ -130,14 +130,25 @@ def load_plan(
             import time as _time  # noqa: PLC0415
             _prof = bool(_os.environ.get("VLLM_PC_TIME_ROPE"))
 
+            # K and V together: ONE stack of [2*M, block, nh, hd] (the M
+            # K tensors then the M V tensors) and ONE host→device copy,
+            # instead of stacking + moving K and V separately. This halves
+            # both the CPU stack-copies and the H2D transfers, and the
+            # single larger contiguous transfer uses PCIe bandwidth better
+            # than two smaller ones. After the move, the K half is sliced
+            # off and delta-RoPE'd; the V half (no rotation) is used as-is.
+            m = len(hit_indices) * num_layers
             if _prof:
                 torch.cuda.synchronize() if torch.cuda.is_available() else None
                 _ts = _time.perf_counter()
-            # Stack: [num_hit_blocks * num_layers, block_size, nh, hd],
-            # block-major then layer (so we can slice it back per block).
-            stacked = torch.stack(
+            kv_stacked = torch.stack(
                 [
                     chunk_lookup.blocks[i].block.keys[layer]
+                    for i in hit_indices
+                    for layer in range(num_layers)
+                ]
+                + [
+                    chunk_lookup.blocks[i].block.values[layer]
                     for i in hit_indices
                     for layer in range(num_layers)
                 ],
@@ -149,14 +160,14 @@ def load_plan(
                 torch.cuda.synchronize() if torch.cuda.is_available() else None
                 _ts = _time.perf_counter()
                 _ = apply_delta_rope_batched(
-                    stacked, delta, rope_theta=rope_theta
+                    kv_stacked[:m], delta, rope_theta=rope_theta
                 )
                 _t_cpu = _time.perf_counter() - _ts
                 # (b) move to GPU then rotate on GPU.
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                     _ts = _time.perf_counter()
-                    _g = stacked.to("cuda")
+                    _g = kv_stacked[:m].to("cuda")
                     torch.cuda.synchronize()
                     _t_move = _time.perf_counter() - _ts
                     _ts = _time.perf_counter()
@@ -171,33 +182,36 @@ def load_plan(
                 _lg.getLogger(__name__).info(
                     "PC rope-prof (M=%d): stack=%.1fms cpu_rotate=%.1fms "
                     "move_gpu=%.1fms gpu_rotate=%.1fms",
-                    stacked.shape[0],
+                    m,
                     _t_stack * 1000, _t_cpu * 1000,
                     _t_move * 1000, _t_gpu * 1000,
                 )
-            # Move K to the target device (cuda) BEFORE rotating so the
-            # delta-RoPE runs on GPU — profiled ~25x faster than on CPU,
-            # with the host→device copy itself only ~1 ms. ``None`` device
-            # keeps it on CPU (prior behaviour).
-            # ---- PROD-PATH profiling (VLLM_PC_TIME_ROPE=1): accumulate
-            # stack / K-move-H2D / rotate across all chunks of this plan so
-            # we can attribute load_plan's residual ~130ms. _PROF_ACC is a
-            # module-global reset per load_plan call.
+            # Single combined H2D copy for K+V. Stores hand back CPU
+            # tensors; rotating K on CPU was profiled ~25x slower than GPU
+            # and dominated load latency, so when a ``device`` is given we
+            # move the whole K+V stack there once (the H2D is ~1ms) and the
+            # downstream scatter becomes a GPU→GPU copy.
+            # ---- PROD-PATH profiling (VLLM_PC_TIME_ROPE=1): k_move now
+            # times the combined K+V H2D; v_move is folded in (stays ~0).
             if _prof and device is not None:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 _ts2 = _time.perf_counter()
             if device is not None:
-                stacked = stacked.to(device)
+                kv_stacked = kv_stacked.to(device)
+            else:
+                kv_stacked = kv_stacked.clone()
             if _prof and device is not None:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 _PROF_ACC["k_move"] += _time.perf_counter() - _ts2
                 _PROF_ACC["stack"] += _t_stack
                 _ts2 = _time.perf_counter()
+            # K half: rotate; V half: leave as-is.
             rotated = apply_delta_rope_batched(
-                stacked, delta, rope_theta=rope_theta
+                kv_stacked[:m], delta, rope_theta=rope_theta
             )
+            v_moved = kv_stacked[m:]
             if _prof and device is not None:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -207,36 +221,8 @@ def load_plan(
                 rotated_per_block[i] = [
                     rotated[base + layer] for layer in range(num_layers)
                 ]
-
-            # V needs no rotation, but it MUST be moved to the device the
-            # same batched way as K: doing it per (block, layer) was
-            # ~1800 tiny H2D copies whose launch+latency overhead dominated
-            # load_plan (~100ms vs ~9ms for K's single batched move). Stack
-            # all V, move once, then unstack to mirror rotated_per_block.
-            if _prof and device is not None:
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                _ts2 = _time.perf_counter()
-            v_stacked = torch.stack(
-                [
-                    chunk_lookup.blocks[i].block.values[layer]
-                    for i in hit_indices
-                    for layer in range(num_layers)
-                ],
-                dim=0,
-            )
-            if device is not None:
-                v_stacked = v_stacked.to(device)
-            else:
-                v_stacked = v_stacked.clone()
-            if _prof and device is not None:
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                _PROF_ACC["v_move"] += _time.perf_counter() - _ts2
-            for slot, i in enumerate(hit_indices):
-                base = slot * num_layers
                 values_per_block[i] = [
-                    v_stacked[base + layer] for layer in range(num_layers)
+                    v_moved[base + layer] for layer in range(num_layers)
                 ]
 
         loaded_blocks: list[LoadedBlock | None] = []
