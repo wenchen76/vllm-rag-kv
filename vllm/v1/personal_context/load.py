@@ -52,6 +52,7 @@ def load_plan(
     plan_lookup: PlanLookup,
     new_pos_starts: tuple[int, ...] | list[int],
     rope_theta: float = 10000.0,
+    device: torch.device | str | None = None,
 ) -> LoadedPlan:
     """Materialise loaded blocks for every hit in ``plan_lookup``.
 
@@ -63,6 +64,16 @@ def load_plan(
             multiple of ``plan_lookup.block_size``.
         rope_theta: RoPE base. Must match the model the K was encoded
             under.
+        device: If given, K (and V) are moved to this device before the
+            delta-RoPE rotation. Stores hand back CPU tensors (the encoder
+            ``.cpu()``s blocks before storing, regardless of backend), and
+            rotating them on CPU dominated load latency — profiled at
+            ~15-65 ms per chunk (~470 ms total for a 14-chunk 2k context)
+            vs ~0.7 ms per chunk on GPU, a ~25x gap, with the host→device
+            copy itself only ~1 ms. Passing the paged cache's device
+            (cuda) runs the rotation on GPU and makes the downstream
+            scatter a GPU→GPU copy. ``None`` keeps tensors on whatever
+            device the store returned (CPU), preserving prior behaviour.
 
     Returns:
         ``LoadedPlan`` with one ``LoadedChunk`` per chunk and one entry
@@ -153,6 +164,12 @@ def load_plan(
                     _t_stack * 1000, _t_cpu * 1000,
                     _t_move * 1000, _t_gpu * 1000,
                 )
+            # Move K to the target device (cuda) BEFORE rotating so the
+            # delta-RoPE runs on GPU — profiled ~25x faster than on CPU,
+            # with the host→device copy itself only ~1 ms. ``None`` device
+            # keeps it on CPU (prior behaviour).
+            if device is not None:
+                stacked = stacked.to(device)
             rotated = apply_delta_rope_batched(
                 stacked, delta, rope_theta=rope_theta
             )
@@ -168,7 +185,13 @@ def load_plan(
                 loaded_blocks.append(None)
                 continue
             block_new_pos = new_pos + i * block_size
-            cloned_values = [v.clone() for v in bl.block.values]
+            # V is position-independent (no rotation) but still moved to
+            # the target device so the downstream scatter is a GPU→GPU
+            # copy rather than a per-block host→device transfer.
+            cloned_values = [
+                (v.to(device) if device is not None else v.clone())
+                for v in bl.block.values
+            ]
             loaded_blocks.append(
                 LoadedBlock(
                     keys=rotated_per_block[i],

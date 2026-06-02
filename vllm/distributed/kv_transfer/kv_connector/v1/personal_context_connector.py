@@ -965,10 +965,16 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
             if _time_load:
                 _sync()
                 _t0 = time.perf_counter()
+            # Rotate K on the paged cache's device (GPU): stores hand back
+            # CPU tensors, and the CPU delta-RoPE was ~25x slower than GPU
+            # and dominated load latency for long contexts. The host→device
+            # copy is ~1ms; scatter then becomes a GPU→GPU copy.
+            load_device = kv_caches[0].device if kv_caches else None
             loaded = load_plan(
                 lookup_result,
                 req_meta.new_pos_starts,
                 rope_theta=self._rope_theta,
+                device=load_device,
             )
             if _time_load:
                 _sync()
