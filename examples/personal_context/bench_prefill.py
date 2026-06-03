@@ -96,10 +96,15 @@ from examples.personal_context.rag_demo import (  # noqa: E402
 
 
 DEFAULT_R_VALUES = "1.0,0.75,0.5,0.25,0.0"
-# 160 (not 128): gold answers run ~50-70 tok, but the sys prompt now asks
-# for all details (dates/times/amounts/names/locations), so completions are
-# a bit longer; 160 keeps the few longest answers from being length-capped.
-DEFAULT_GEN_TOKENS = 160
+# 128, paired with stop=["\n\n"] in _sampling. Partial-r reuse leaves stale K
+# in the un-recomputed positions, which suppresses EOS: the model finishes a
+# correct answer, fails to stop, and rambles to max_tokens — usually a
+# hallucinated "Question?\n\nAnswer:" loop bleeding other instances' content.
+# stop=["\n\n"] cuts that loop at its first blank line (the legit answers are
+# single paragraphs), so quality reflects the answer, not the ramble. The
+# longest legit completion runs ~95 tok, so 128 clears it while still capping
+# the rare run-on hallucination that has no blank line for the stop to catch.
+DEFAULT_GEN_TOKENS = 128
 
 
 # ----------------------------- data classes -----------------------------
@@ -288,8 +293,16 @@ def _bench_for_r(
     )
 
     # Vanilla passes no reuse_plan; sparse-Q runs pass the connector params.
+    # stop=["\n\n"] truncates the no-EOS degeneration tail at its first blank
+    # line; vLLM excludes the stop string from the output, and both vanilla and
+    # reuse runs share it so the comparison stays fair. TTFT is unaffected
+    # (it's first-token latency, independent of when generation stops).
     def _sampling(max_tokens: int) -> SamplingParams:
-        kwargs: dict = {"max_tokens": max_tokens, "temperature": 0.0}
+        kwargs: dict = {
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "stop": ["\n\n"],
+        }
         return kwargs
 
     measurements: list[Measurement] = []
