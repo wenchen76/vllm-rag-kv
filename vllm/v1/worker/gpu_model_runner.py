@@ -5489,6 +5489,46 @@ class GPUModelRunner(
                 self.device, non_blocking=True
             )
 
+            # === TEMP: PersonalContext answer-logprob dump (VLLM_PC_PPL_DUMP) =
+            # The standard path below slices hidden_states from the FRONT
+            # (assuming a contiguous suffix), which PC sparse-Q breaks — it also
+            # forwards scattered recompute positions that land at the front of
+            # this request's hidden block. The answer is always the TAIL of the
+            # block (sorted(selected ∪ query ∪ answer)), so we re-score the last
+            # K suffix tokens from the tail hiddens and dump them for offline
+            # answer-PPL. Independent of the buggy code below. Remove when done.
+            import os as _pc_os  # noqa: PLC0415
+            _pc_dump = _pc_os.environ.get("VLLM_PC_PPL_DUMP")
+            if _pc_dump:
+                try:
+                    _ri = self.input_batch.req_id_to_index[req_id]
+                    _end = int(self.query_start_loc.np[_ri + 1])
+                    _suffix = num_prompt_tokens - request.num_computed_tokens
+                    _k = min(_suffix - 1, 256)
+                    if _k > 0:
+                        _hid = hidden_states[_end - 1 - _k : _end - 1]
+                        _lp = self.sampler.compute_logprobs(
+                            self.model.compute_logits(_hid)
+                        )
+                        _tgt = prompt_token_ids[
+                            num_prompt_tokens - _k : num_prompt_tokens
+                        ]
+                        _tlp = _lp.gather(1, _tgt.view(-1, 1)).squeeze(1)
+                        import json as _pc_json  # noqa: PLC0415
+                        with open(_pc_dump, "a", encoding="utf-8") as _pc_f:
+                            _pc_f.write(_pc_json.dumps({
+                                "req_id": req_id,
+                                "num_prompt": int(num_prompt_tokens),
+                                "token_logprobs": [
+                                    round(float(x), 5) for x in _tlp.tolist()
+                                ],
+                            }) + "\n")
+                except Exception as _pc_e:  # noqa: BLE001
+                    import sys as _pc_sys  # noqa: PLC0415
+                    print(f"[PC_PPL_DUMP] {req_id}: {_pc_e!r}",
+                          file=_pc_sys.stderr)
+            # === END TEMP ====================================================
+
             # Set up target LogprobsTensors object.
             logprobs_tensors = request.in_progress_prompt_logprobs_cpu
             if logprobs_tensors is None:

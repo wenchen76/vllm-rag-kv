@@ -37,6 +37,7 @@ import contextlib
 import gc
 import json
 import math
+import os
 import statistics as st
 import sys
 from pathlib import Path
@@ -122,7 +123,14 @@ def _run_mode(r, specs, sys_padded_tokens, tok, args):
             kv_connector_extra_config=extra,
         )
 
-    print(f"\n{'=' * 72}\n[verify] booting LLM: {label}\n{'=' * 72}")
+    # Per-mode dump file for the in-runner answer-logprob dump. Set the env
+    # var BEFORE LLM(): the spawned worker inherits it at spawn time.
+    dump_path = f"/tmp/pc_ppl_{label.replace('=', '').replace('.', 'p')}.jsonl"
+    os.environ["VLLM_PC_PPL_DUMP"] = dump_path
+    open(dump_path, "w", encoding="utf-8").close()  # truncate per mode
+
+    print(f"\n{'=' * 72}\n[verify] booting LLM: {label}  (dump={dump_path})"
+          f"\n{'=' * 72}")
     llm = LLM(
         model=args.model,
         dtype="float16",
@@ -134,7 +142,8 @@ def _run_mode(r, specs, sys_padded_tokens, tok, args):
         disable_log_stats=False,
     )
 
-    rows = []
+    # raw rows: (id, ttft, broken_ppl, note, num_prompt, answer_len)
+    raw: list[tuple] = []
     try:
         # Warmup 1: sys-only -> caches sys prefix (so real requests get
         # num_computed_tokens=sys_len and PC can place chunks) + JITs kernels.
@@ -153,15 +162,17 @@ def _run_mode(r, specs, sys_padded_tokens, tok, args):
                 ],
             )
 
-        for k, s in enumerate(specs):
+        for s in specs:
             sp = _ppl_sampling(None if is_vanilla else s["reuse_params"])
+            np_len, alen = len(s["full_ids"]), len(s["answer_ids"])
             try:
                 out = llm.generate(
                     [TokensPrompt(prompt_token_ids=list(s["full_ids"]))],
                     sampling_params=[SamplingParams(**sp)],
                 )[0]
             except Exception as e:  # noqa: BLE001
-                rows.append((s["id"], None, None, f"GENERATE RAISED: {e!r}"))
+                raw.append((s["id"], None, None, f"GENERATE RAISED: {e!r}",
+                            np_len, alen))
                 continue
 
             m = out.metrics
@@ -170,30 +181,41 @@ def _run_mode(r, specs, sys_padded_tokens, tok, args):
                 if m is not None and m.first_token_latency is not None
                 else None
             )
-            ppl, note = _answer_ppl(out, s["answer_start"], s["answer_ids"])
-            rows.append((s["id"], ttft, ppl, note))
-
-            # For the first instance, dump per-token answer logprobs so the
-            # PPL is auditable — confirms we're scoring the right span.
-            if k == 0:
-                gen_tok = (
-                    tok.decode(out.outputs[0].token_ids)
-                    if out.outputs else "<none>"
-                )
-                print(f"\n[verify] {label} {s['id']}: per-answer-token logprob "
-                      f"(gen 1st token = {gen_tok!r})")
-                pls = out.prompt_logprobs or []
-                for offset, atok in enumerate(s["answer_ids"][:14]):
-                    i = s["answer_start"] + offset
-                    entry = pls[i] if i < len(pls) else None
-                    lp = entry.get(atok) if entry else None
-                    val = f"{lp.logprob:+.3f}" if lp is not None else "MISSING"
-                    print(f"    [{offset:>2}] {tok.decode([atok])!r:<14} "
-                          f"logp={val}")
+            # broken_ppl: read straight off RequestOutput.prompt_logprobs (the
+            # head-sliced path) — kept for contrast; corrected_ppl below comes
+            # from the in-runner tail-slice dump.
+            broken_ppl, note = _answer_ppl(
+                out, s["answer_start"], s["answer_ids"]
+            )
+            raw.append((s["id"], ttft, broken_ppl, note, np_len, alen))
     finally:
         del llm
         gc.collect()
         torch.cuda.empty_cache()
+
+    # Corrected answer-PPL from the in-runner dump: the dumped token_logprobs
+    # are the last K suffix tokens (tail-sliced past any recompute hiddens), so
+    # the answer is the last `answer_len` of them. Match dump lines to specs by
+    # num_prompt (last write wins; warmup of spec[0] shares its num_prompt but
+    # is identical).
+    by_np: dict[int, list[float]] = {}
+    try:
+        with open(dump_path, encoding="utf-8") as f:
+            for line in f:
+                d = json.loads(line)
+                by_np[int(d["num_prompt"])] = d["token_logprobs"]
+    except FileNotFoundError:
+        pass
+
+    rows = []
+    for sid, ttft, broken_ppl, note, np_len, alen in raw:
+        tlp = by_np.get(np_len)
+        if tlp and len(tlp) >= alen and alen > 0:
+            ans = tlp[-alen:]
+            corrected_ppl = math.exp(-sum(ans) / len(ans))
+        else:
+            corrected_ppl = None
+        rows.append((sid, ttft, broken_ppl, corrected_ppl, note))
     return label, rows
 
 
@@ -276,32 +298,32 @@ def main() -> None:
             results[label] = rows
 
     # ---------------- report ----------------
-    print(f"\n{'=' * 72}\n[verify] RESULTS  (TTFT ms, answer-PPL)\n{'=' * 72}")
-    header = (f"  {'instance':<16}{'TTFT van':>10}{'TTFT r0.5':>11}"
-              f"{'PPL van':>10}{'PPL r0.5':>10}  note(r0.5)")
-    print(header)
+    print(f"\n{'=' * 72}\n[verify] RESULTS  (TTFT ms; cPPL = corrected "
+          f"answer-PPL from in-runner tail-slice dump)\n{'=' * 72}")
+    print(f"  {'instance':<16}{'TTFT van':>10}{'TTFT r0.5':>11}"
+          f"{'cPPL van':>10}{'cPPL r0.5':>11}  note(r0.5)")
     van = {row[0]: row for row in results["vanilla"]}
     r05 = {row[0]: row for row in results["r=0.5"]}
-    tv, tr, pv, pr = [], [], [], []
+    tv, tr, vc, rc, rb = [], [], [], [], []
 
     def fmt(x):
         return f"{x:.1f}" if x is not None else "--"
 
     for s in specs:
         sid = s["id"]
-        _, vt, vp, _ = van[sid]
-        _, rt, rp, rnote = r05[sid]
-        for acc, val in ((tv, vt), (tr, rt), (pv, vp), (pr, rp)):
+        _, vt, _vbp, vcp, _ = van[sid]
+        _, rt, rbp, rcp, rnote = r05[sid]
+        for acc, val in ((tv, vt), (tr, rt), (vc, vcp), (rc, rcp), (rb, rbp)):
             if val is not None:
                 acc.append(val)
         print(f"  {sid:<16}{fmt(vt):>10}{fmt(rt):>11}"
-              f"{fmt(vp):>10}{fmt(rp):>10}  {rnote}")
+              f"{fmt(vcp):>10}{fmt(rcp):>11}  {rnote}")
 
     def med(x):
         return st.median(x) if x else float("nan")
 
     print(f"  {'MEDIAN':<16}{med(tv):>10.1f}{med(tr):>11.1f}"
-          f"{med(pv):>10.2f}{med(pr):>10.2f}")
+          f"{med(vc):>10.2f}{med(rc):>11.2f}")
 
     # ---------------- verdicts ----------------
     print(f"\n{'-' * 72}\nVERDICTS\n{'-' * 72}")
@@ -317,17 +339,24 @@ def main() -> None:
     else:
         print("  PROBE 1 N/A: missing TTFT (see notes above).")
 
-    n_ok = sum(1 for row in results["r=0.5"] if row[2] is not None)
-    if n_ok == len(specs) and pr:
-        print(f"  PROBE 2 PASS: {n_ok}/{len(specs)} r=0.5 answer-PPLs finite "
-              f"(median {med(pr):.2f}; vanilla {med(pv):.2f}).")
+    n_ok = sum(1 for row in results["r=0.5"] if row[3] is not None)
+    if n_ok == len(specs) and rc:
+        print(f"  PROBE 2 PASS: {n_ok}/{len(specs)} r=0.5 corrected answer-PPLs "
+              f"finite (median {med(rc):.2f}; vanilla {med(vc):.2f}).")
     else:
-        print(f"  PROBE 2 FAIL: only {n_ok}/{len(specs)} r=0.5 answer-PPLs "
-              "finite -> answer-span logits missing under the escape hatch.")
+        print(f"  PROBE 2 FAIL: only {n_ok}/{len(specs)} r=0.5 corrected "
+              "answer-PPLs finite -> in-runner dump missing (check stderr "
+              "[PC_PPL_DUMP] and GENERATE RAISED notes).")
 
-    print("\n  Sanity: a well-supported answer usually scores PPL ~1.5-15, and "
-          "r=0.5 should sit close to vanilla. Both probes PASS => safe to wire "
-          "PPL into the full sweep.")
+    # Contrast with the broken head-sliced path (RequestOutput.prompt_logprobs).
+    if rb:
+        print(f"  CONTRAST: broken head-slice r=0.5 PPL median = {med(rb):.1f} "
+              f"vs corrected {med(rc):.2f} -> the tail-slice dump is what makes "
+              "it usable.")
+
+    print("\n  Sanity: a well-supported answer scores PPL ~1.5-15; corrected "
+          "r=0.5 should sit close to vanilla. PROBE1+PROBE2 PASS and r=0.5 "
+          "cPPL ~ vanilla => the in-runner dump gives trustworthy PPL.")
 
 
 if __name__ == "__main__":

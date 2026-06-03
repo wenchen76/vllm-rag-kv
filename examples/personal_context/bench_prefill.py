@@ -66,6 +66,7 @@ import contextlib
 import dataclasses
 import gc
 import json
+import statistics
 import sys
 import time
 from collections import defaultdict
@@ -598,19 +599,30 @@ def _print_recovery(
 
     print("\n" + "-" * 100)
     print("Recovery per (intermediate r, instance)")
-    print(
-        "  recovery_metric(r) = (q(r) - q_stale) / (q_gold - q_stale)"
-    )
-    print(
-        "  1.0  hybrid matches gold (full quality with partial recompute)"
-    )
-    print("  0.0  hybrid no better than stale (selection didn't help)")
-    print("  >1.0 hybrid better than gold (rare; lucky paraphrasing)")
-    print("  <0   hybrid worse than stale (bad strategy)")
-    print(
-        "  N/A  endpoints collapsed (q_stale ≈ q_gold) — recovery undefined"
-    )
+    print("  recovery(r) = (q(r) - q_stale) / (q_gold - q_stale)   "
+          "[q_gold=r1.0, q_stale=r0.0; higher q = better]")
+    print("  Per-instance rows use that instance's OWN gold/stale gap as the "
+          "denominator:")
+    print("    1.0 matches gold   0.0 no better than stale   "
+          ">1.0 better than gold (lucky)   <0 worse than stale")
+    print("    N/A  this instance's gold ≈ stale (gap < 1e-9)")
+    print("  Summary rows aggregate ACROSS instances three ways:")
+    print("    MoR       mean of per-instance ratios — OUTLIER-PRONE: one "
+          "near-zero gap (gap≈0.001")
+    print("              -> ratio≈100) dominates the average. Shown only for "
+          "contrast.")
+    print("    RoMean    ratio-of-means:   "
+          "(mean q(r)   - mean q_stale)   / (mean q_gold   - mean q_stale)")
+    print("    RoMedian  ratio-of-medians: "
+          "(median q(r) - median q_stale) / (median q_gold - median q_stale)")
+    print("  RoMean/RoMedian never divide per-instance, so they never blow up; "
+          "but when the")
+    print("  aggregate gap is tiny the ratio is still sensitive — always read "
+          "the gap row.")
     print("-" * 100)
+
+    def _fmt(x: float | None) -> str:
+        return f"{x:>11.3f} " if x is not None else f"{'N/A':>12}"
 
     for metric_name, getter in [
         ("ROUGE-L", lambda m: m.rouge_l),
@@ -621,29 +633,62 @@ def _print_recovery(
             f"  {'instance':<20}"
             + "".join(f"{f'r={r}':>12}" for r in intermediate)
         )
-        sum_rec: dict[float, float] = defaultdict(float)
-        cnt_rec: dict[float, int] = defaultdict(int)
+
+        # Per-r column of per-instance values (gold = r1.0, stale = r0.0).
+        cols = {
+            r: [getter(results[r][i]) for i in range(len(query_specs))]
+            for r in ([0.0, 1.0] + intermediate)
+        }
+        gold, stale = cols[1.0], cols[0.0]
+
+        # Per-instance table + mean-of-ratios accumulator (the unstable one).
+        mor_sum: dict[float, float] = defaultdict(float)
+        mor_cnt: dict[float, int] = defaultdict(int)
         for i, spec in enumerate(query_specs):
             row = f"  {spec.instance_id:<20}"
-            q_gold = getter(results[1.0][i])
-            q_stale = getter(results[0.0][i])
+            denom_i = gold[i] - stale[i]
             for r in intermediate:
-                q_hyb = getter(results[r][i])
-                denom = q_gold - q_stale
-                if abs(denom) < 1e-9:
+                if abs(denom_i) < 1e-9:
                     row += f"{'N/A':>12}"
                     continue
-                rec = (q_hyb - q_stale) / denom
-                sum_rec[r] += rec
-                cnt_rec[r] += 1
+                rec = (cols[r][i] - stale[i]) / denom_i
+                mor_sum[r] += rec
+                mor_cnt[r] += 1
                 row += f"{rec:>11.3f} "
             print(row)
-        print(f"  {'AVG':<20}", end="")
+
+        # Aggregate anchors — the gap tells you whether recovery is meaningful.
+        mean_gold, mean_stale = statistics.fmean(gold), statistics.fmean(stale)
+        med_gold, med_stale = statistics.median(gold), statistics.median(stale)
+        print(f"  {'anchor gold r=1.0':<20}  "
+              f"mean={mean_gold:.3f}  median={med_gold:.3f}")
+        print(f"  {'anchor stale r=0.0':<20}  "
+              f"mean={mean_stale:.3f}  median={med_stale:.3f}")
+        print(f"  {'gap (gold-stale)':<20}  "
+              f"mean={mean_gold - mean_stale:+.3f}  "
+              f"median={med_gold - med_stale:+.3f}")
+
+        # Three summary recovery rows.
+        denom_mean = mean_gold - mean_stale
+        denom_med = med_gold - med_stale
+
+        print(f"  {'MoR (unstable)':<20}", end="")
         for r in intermediate:
-            if cnt_rec[r]:
-                print(f"{sum_rec[r] / cnt_rec[r]:>11.3f} ", end="")
-            else:
-                print(f"{'N/A':>12}", end="")
+            print(_fmt(mor_sum[r] / mor_cnt[r] if mor_cnt[r] else None), end="")
+        print()
+
+        print(f"  {'RoMean':<20}", end="")
+        for r in intermediate:
+            rm = ((statistics.fmean(cols[r]) - mean_stale) / denom_mean
+                  if abs(denom_mean) > 1e-9 else None)
+            print(_fmt(rm), end="")
+        print()
+
+        print(f"  {'RoMedian':<20}", end="")
+        for r in intermediate:
+            rmd = ((statistics.median(cols[r]) - med_stale) / denom_med
+                   if abs(denom_med) > 1e-9 else None)
+            print(_fmt(rmd), end="")
         print()
 
 
