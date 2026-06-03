@@ -2,25 +2,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Phase 13 bench: TTFT + generation-quality + recovery vs selector_r.
 
-Per ``(selector_r, query)`` we make two ``llm.generate`` calls:
+Per ``(selector_r, query)`` we make ONE ``llm.generate`` call
+(``max_tokens=gen_tokens``) over the production ``sys + chunks + query``
+prompt, and read both numbers off that single forward:
 
-    1. **Call 1 — TTFT measurement** (``max_tokens=1``):
-       prompt is the *production* ``sys + chunks + query``. Wall-clock
-       around the call is the latency a real user would see. PC's
-       sparse-Q activates here at the configured ``r``, leaving the
-       r-specific chunk K/V in vLLM's prefix cache.
+    - **TTFT**: from ``RequestOutput.metrics.first_token_latency`` — the
+      engine's own arrival→first-token time (requires the LLM be booted
+      with ``disable_log_stats=False``). This is cleaner than wall-
+      clocking a separate ``max_tokens=1`` call, and it means TTFT and the
+      scored generation describe the SAME forward at the configured ``r``.
 
-    2. **Call 2 — generation for quality scoring** (``max_tokens=128``):
-       same prompt as Call 1. vLLM's prefix cache hits the full
-       prefill, so this call only runs decode against the r-specific
-       cached K/V. Generated text reflects the r-specific cache state
-       end-to-end.
+    - **Quality**: ROUGE-L + cosine on the generated text.
+
+PC's sparse-Q activates on this call at the configured ``r``; vanilla
+runs (r=None) attach no connector and pay a full prefill.
 
 Quality is scored on the generated text via two complementary metrics:
 
     - **ROUGE-L** (lexical): catches single-token factual flips
-      (``"Yes"`` ↔ ``"No"``, ``"May 16"`` ↔ ``"May 6"``) that
-      perplexity averaging would dilute. Costs ~ms.
+      (``"Yes"`` ↔ ``"No"``, ``"May 16"`` ↔ ``"May 6"``).
     - **Cosine sim** on sentence-transformer embeddings (semantic):
       tolerant to paraphrasing, catches "totally off topic" cases
       ROUGE might miss. Reuses the existing demo embedder.
@@ -36,26 +36,22 @@ with ``q`` being either rouge_l or cos_sim, ``q_stale`` at r=0.0
 WHY NOT PERPLEXITY
 ------------------
 The natural metric is perplexity over the gold answer
-(``prompt_logprobs=1`` on ``sys+chunks+query+gold``). It doesn't
-work: vLLM disables prefix caching for ``prompt_logprobs`` requests
-(cached blocks have no stored logprobs, so the engine must fresh-
-prefill the whole prompt). PC's placement validation then sees
-``num_computed_tokens=0`` and refuses to activate, so all r values
-collapse to vanilla full prefill — identical perplexity, useless
-recovery. Verified empirically (see commit history).
+(``prompt_logprobs=1``). By default it doesn't compose with reuse:
+``prompt_logprobs`` sets ``skip_reading_prefix_cache=True``, so the
+scheduler reports ``num_computed_tokens=0``, PC's placement check
+refuses to activate, and every r collapses to vanilla full prefill.
+There is an escape hatch (pass ``skip_reading_prefix_cache=False``
+explicitly), but prefix-cache-hit tokens have no computed logits, so the
+returned prompt_logprobs can be incomplete over exactly the chunk span
+we'd want to score. Generation-based ROUGE/cosine sidesteps this and
+lets PC activate normally; revisit perplexity later if needed.
 
-Generation-based quality lets PC activate normally (no
-prompt_logprobs in the request), at the cost of a slower second
-call.
-
-CAVEAT — prefix cache pollution
+CAVEAT — prefix cache isolation
 -------------------------------
 PC's scatter writes chunk K/V into the worker's paged cache; vLLM's
-prefix cache then captures those blocks. A second request with the
-same prompt would inherit the first request's K/V state regardless
-of its own r. This bench tears down the LLM between r values to
-keep that contamination from leaking across r. Static-r production
-is unaffected.
+prefix cache could then capture those blocks. This bench tears down the
+LLM between r values so one r's scattered K/V can't leak into the next.
+Static-r production is unaffected.
 
 Usage:
     redis-server --daemonize yes --port 6379  # or docker
@@ -102,8 +98,7 @@ from examples.personal_context.rag_demo import (  # noqa: E402
 DEFAULT_R_VALUES = "1.0,0.75,0.5,0.25,0.0"
 # 160 (not 128): gold answers run ~50-70 tok, but the sys prompt now asks
 # for all details (dates/times/amounts/names/locations), so completions are
-# a bit longer; 160 keeps the few longest answers from being length-capped
-# without materially slowing Call 2.
+# a bit longer; 160 keeps the few longest answers from being length-capped.
 DEFAULT_GEN_TOKENS = 160
 
 
@@ -286,6 +281,10 @@ def _bench_for_r(
         enforce_eager=True,
         kv_transfer_config=kv_transfer_config,
         attention_config={"backend": "FLASHINFER"},
+        # Populate RequestOutput.metrics so we can read the engine-internal
+        # TTFT (first_token_latency) from the single generation call below,
+        # instead of wall-clocking a separate max_tokens=1 call.
+        disable_log_stats=False,
     )
 
     # Vanilla passes no reuse_plan; sparse-Q runs pass the connector params.
@@ -306,52 +305,37 @@ def _bench_for_r(
         )
 
         for spec in query_specs:
-            # ---- Call 1: TTFT on production prompt ----
-            # sparse-Q runs: PC connector activates here, scattering the
-            # r-specific chunk K/V into the paged cache (captured by the
-            # prefix-cache for Call 2). Vanilla: plain full prefill, no
-            # reuse_plan, so this is the baseline TTFT.
-            ttft_kwargs = _sampling(1)
+            # ---- Single call: one generation gives BOTH TTFT and quality
+            # ----
+            # sparse-Q runs activate the PC connector here (scatter + sparse
+            # prefill); vanilla is a plain full prefill (no reuse_plan).
+            # TTFT comes from the engine's own RequestOutput.metrics
+            # (first_token_latency) rather than wall-clocking a separate
+            # max_tokens=1 call, so TTFT and the scored generation describe
+            # the SAME forward — no second call, and no Call-2 prefix-cache
+            # overflow warning.
+            gen_kwargs = _sampling(args.gen_tokens)
             if not is_vanilla:
-                ttft_kwargs["extra_args"] = spec.reuse_params
-            sp_ttft = SamplingParams(**ttft_kwargs)
-            t_start = time.perf_counter()
-            _ = llm.generate(
+                gen_kwargs["extra_args"] = spec.reuse_params
+            out = llm.generate(
                 [TokensPrompt(prompt_token_ids=list(spec.prod_prompt_ids))],
-                sampling_params=[sp_ttft],
-            )
-            t_end = time.perf_counter()
-            ttft_ms = (t_end - t_start) * 1000.0
+                sampling_params=[SamplingParams(**gen_kwargs)],
+            )[0]
 
-            # ---- Call 2: generation for quality scoring ----
-            # Same prompt → vLLM prefix-cache hits the full prefill;
-            # this call effectively just decodes gen_tokens against the
-            # cached K/V from Call 1. (sparse-Q: PC connector logs a
-            # harmless placement-overflow warning — 0 new chunk tokens to
-            # match here, because Call 1 already prefix-cached the whole
-            # prompt.) Vanilla scores quality of a true full prefill.
-            #
-            # --skip_quality drops Call 2 entirely: it isolates the Call 1
-            # TTFT log (no Call 2 generate, no Call 2 overflow warning) so
-            # you can see exactly whether Call 1's reuse activated. ROUGE/
-            # cosine are reported as NaN in that mode.
-            if args.skip_quality:
-                gen_text = ""
-                rouge_l = float("nan")
-                cos_sim = float("nan")
-            else:
-                gen_kwargs = _sampling(args.gen_tokens)
-                if not is_vanilla:
-                    gen_kwargs["extra_args"] = spec.reuse_params
-                sp_gen = SamplingParams(**gen_kwargs)
-                out = llm.generate(
-                    [TokensPrompt(prompt_token_ids=list(spec.prod_prompt_ids))],
-                    sampling_params=[sp_gen],
+            metrics = out.metrics
+            if metrics is None or metrics.first_token_latency is None:
+                # Shouldn't happen with disable_log_stats=False, but fail
+                # loudly rather than silently logging a bogus 0.
+                raise RuntimeError(
+                    f"{spec.instance_id}: RequestOutput.metrics missing "
+                    "first_token_latency; was disable_log_stats=False set?"
                 )
-                gen_text = out[0].outputs[0].text
-                rouge_l, cos_sim = _score_generation(
-                    spec.gold_text, gen_text, embedder, rouge_scorer
-                )
+            ttft_ms = metrics.first_token_latency * 1000.0
+
+            gen_text = out.outputs[0].text
+            rouge_l, cos_sim = _score_generation(
+                spec.gold_text, gen_text, embedder, rouge_scorer
+            )
 
             print(
                 f"[bench] {r_label}: {spec.instance_id}: "
@@ -691,16 +675,8 @@ def main() -> None:
         "--gen_tokens",
         type=int,
         default=DEFAULT_GEN_TOKENS,
-        help="Max generation length (Call 2). Should comfortably exceed "
-        "gold answer length so ROUGE recall isn't truncated.",
-    )
-    parser.add_argument(
-        "--skip_quality",
-        action="store_true",
-        help="Drop Call 2 (the quality-scoring generation). Leaves only "
-        "the Call 1 TTFT measurement — useful for isolating whether Call "
-        "1's reuse activated, with no Call 2 generate or its harmless "
-        "prefix-cache overflow warning. ROUGE/cosine become NaN.",
+        help="Max generation length. Should comfortably exceed gold "
+        "answer length so ROUGE recall isn't truncated.",
     )
     parser.add_argument(
         "--store_backend",
@@ -760,7 +736,7 @@ def main() -> None:
         instances = [json.loads(line) for line in f if line.strip()]
     print(f"[bench] loaded {len(instances)} instances from {args.data}")
     print(f"[bench] r values: {r_values}")
-    print(f"[bench] gen_tokens (Call 2 max_tokens): {args.gen_tokens}")
+    print(f"[bench] gen_tokens (max_tokens): {args.gen_tokens}")
 
     preset = preset_for(args.model)
     print(
