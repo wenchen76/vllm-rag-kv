@@ -96,14 +96,13 @@ from examples.personal_context.rag_demo import (  # noqa: E402
 
 
 DEFAULT_R_VALUES = "1.0,0.75,0.5,0.25,0.0"
-# 128, paired with stop=["\n\n"] in _sampling. Partial-r reuse leaves stale K
-# in the un-recomputed positions, which suppresses EOS: the model finishes a
-# correct answer, fails to stop, and rambles to max_tokens — usually a
-# hallucinated "Question?\n\nAnswer:" loop bleeding other instances' content.
-# stop=["\n\n"] cuts that loop at its first blank line (the legit answers are
-# single paragraphs), so quality reflects the answer, not the ramble. The
-# longest legit completion runs ~95 tok, so 128 clears it while still capping
-# the rare run-on hallucination that has no blank line for the stop to catch.
+# 128. The "Question?\n\nAnswer:" runaway seen earlier turned out to be the
+# model reciting distractor chunks pulled in by an oversized top_k, not an
+# inherent partial-r failure: right-sizing top_k removes the distractors and
+# EOS fires normally, so completions self-terminate well under this cap. 128
+# stays as a safety ceiling — it clears the longest legit answer (~95 tok)
+# while bounding any genuine low-r runaway. See _sampling for why there is no
+# stop sequence.
 DEFAULT_GEN_TOKENS = 128
 
 
@@ -293,16 +292,17 @@ def _bench_for_r(
     )
 
     # Vanilla passes no reuse_plan; sparse-Q runs pass the connector params.
-    # stop=["\n\n"] truncates the no-EOS degeneration tail at its first blank
-    # line; vLLM excludes the stop string from the output, and both vanilla and
-    # reuse runs share it so the comparison stays fair. TTFT is unaffected
-    # (it's first-token latency, independent of when generation stops).
+    # No stop sequence, deliberately. A bare stop=["\n\n"] was tried to cut the
+    # no-EOS degeneration tail, but that tail's real cause was distractor chunks
+    # pulled in by an oversized top_k: the model recited them in a runaway
+    # "Question?\n\nAnswer:" loop. Right-sizing top_k removes the distractors,
+    # EOS fires normally, and the loop disappears. The stop then only ever fired
+    # on legit answers shaped "Here's the answer:\n\n<content>", truncating them
+    # (sometimes to nothing) — net harmful. max_tokens caps any real runaway,
+    # and at low r the residual degeneration is genuine signal the sweep should
+    # surface rather than mask.
     def _sampling(max_tokens: int) -> SamplingParams:
-        kwargs: dict = {
-            "max_tokens": max_tokens,
-            "temperature": 0.0,
-            "stop": ["\n\n"],
-        }
+        kwargs: dict = {"max_tokens": max_tokens, "temperature": 0.0}
         return kwargs
 
     measurements: list[Measurement] = []
