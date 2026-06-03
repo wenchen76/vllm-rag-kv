@@ -51,6 +51,18 @@ prod_ids, reuse_params, _sys_raw, _sys_pad = build_prompt_and_plan(
     block_size=BLOCK_SIZE,
 )
 
+# Free the HF encoder (~15GB for an 8B model) BEFORE booting vLLM, or both
+# 8B models sit in VRAM at once and OOM a 24GB card (mirrors bench main).
+import gc  # noqa: E402
+
+import torch  # noqa: E402
+
+if getattr(index, "encoder", None) is not None:
+    del index.encoder
+    index.encoder = None
+    gc.collect()
+    torch.cuda.empty_cache()
+
 from vllm import LLM, SamplingParams  # noqa: E402
 from vllm.config import KVTransferConfig  # noqa: E402
 from vllm.inputs import TokensPrompt  # noqa: E402
