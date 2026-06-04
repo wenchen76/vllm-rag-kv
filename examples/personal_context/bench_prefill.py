@@ -152,7 +152,16 @@ def _build_query_specs(
     tokenizer = index.tokenizer
     specs: list[QuerySpec] = []
     for inst in instances:
-        retrieved = index.retrieve(inst["query"], top_k=args.top_k)
+        if args.oracle_retrieval:
+            # Oracle: skip retrieval; feed this instance's OWN chunks (top_k by
+            # retrieval_rank). No cross-instance contamination, so the only
+            # variable left is the reuse fraction r.
+            retrieved = sorted(
+                (e for e in index.entries if e.instance_id == inst["id"]),
+                key=lambda e: e.gold_rank,
+            )[: args.top_k]
+        else:
+            retrieved = index.retrieve(inst["query"], top_k=args.top_k)
         (
             prod_prompt_ids,
             reuse_params,
@@ -771,7 +780,14 @@ def main() -> None:
         "--top_k",
         type=int,
         default=4,
-        help="FAISS retrieval top-K per query.",
+        help="Retrieval top-K per query (also caps the oracle own-chunk count).",
+    )
+    parser.add_argument(
+        "--oracle_retrieval",
+        action="store_true",
+        help="Skip retrieval; feed each instance's OWN gold chunks (top_k by "
+        "retrieval_rank) before the query. Isolates the reuse (r) effect from "
+        "retrieval noise / cross-instance contamination. Needs no faiss.",
     )
     parser.add_argument(
         "--r_values",
@@ -848,6 +864,11 @@ def main() -> None:
     print(f"[bench] loaded {len(instances)} instances from {args.data}")
     print(f"[bench] r values: {r_values}")
     print(f"[bench] gen_tokens (max_tokens): {args.gen_tokens}")
+    print(
+        f"[bench] retrieval: "
+        f"{'ORACLE (own chunks, no faiss)' if args.oracle_retrieval else 'faiss'}"
+        f", top_k={args.top_k}"
+    )
 
     preset = preset_for(args.model)
     print(
@@ -865,7 +886,8 @@ def main() -> None:
         store_url=args.store_url,
     )
     index.ingest_instances(instances)
-    index.build_faiss()
+    if not args.oracle_retrieval:
+        index.build_faiss()  # oracle mode never retrieves -> skip (no faiss)
 
     # ----- 2. Pre-compute everything we need per query -----
     query_specs = _build_query_specs(instances, index, args)

@@ -187,13 +187,8 @@ class RAGIndex:
         store_backend: str = "memory",
         store_url: str = DEFAULT_REDIS_URL,
     ):
-        try:
-            import faiss  # noqa: F401  (validate availability)
-        except ImportError as e:
-            raise ImportError(
-                "RAGIndex requires faiss-cpu (or faiss-gpu). "
-                "Install via `uv pip install faiss-cpu`."
-            ) from e
+        # faiss is validated lazily in build_faiss() (the only place it's
+        # used), so oracle-retrieval runs that never retrieve need no faiss.
         try:
             from sentence_transformers import SentenceTransformer
         except ImportError as e:
@@ -342,7 +337,14 @@ class RAGIndex:
     # ----- FAISS -----
 
     def build_faiss(self) -> None:
-        import faiss
+        try:
+            import faiss
+        except ImportError as e:
+            raise ImportError(
+                "RAGIndex.build_faiss() requires faiss-cpu (or faiss-gpu). "
+                "Install via `uv pip install faiss-cpu`, or run with oracle "
+                "retrieval (--oracle_retrieval), which needs no faiss."
+            ) from e
 
         if not self.entries:
             raise RuntimeError("no entries to index; call ingest_instances first")
