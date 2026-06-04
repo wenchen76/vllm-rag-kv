@@ -66,6 +66,7 @@ import contextlib
 import dataclasses
 import gc
 import json
+import statistics
 import sys
 import time
 from collections import defaultdict
@@ -96,10 +97,14 @@ from examples.personal_context.rag_demo import (  # noqa: E402
 
 
 DEFAULT_R_VALUES = "1.0,0.75,0.5,0.25,0.0"
-# 160 (not 128): gold answers run ~50-70 tok, but the sys prompt now asks
-# for all details (dates/times/amounts/names/locations), so completions are
-# a bit longer; 160 keeps the few longest answers from being length-capped.
-DEFAULT_GEN_TOKENS = 160
+# 128. The "Question?\n\nAnswer:" runaway seen earlier turned out to be the
+# model reciting distractor chunks pulled in by an oversized top_k, not an
+# inherent partial-r failure: right-sizing top_k removes the distractors and
+# EOS fires normally, so completions self-terminate well under this cap. 128
+# stays as a safety ceiling — it clears the longest legit answer (~95 tok)
+# while bounding any genuine low-r runaway. See _sampling for why there is no
+# stop sequence.
+DEFAULT_GEN_TOKENS = 128
 
 
 # ----------------------------- data classes -----------------------------
@@ -116,6 +121,10 @@ class QuerySpec:
     reuse_params: dict             # extra_args for the connector
     sys_len_padded: int
     chunks_total: int
+    # (source_instance_id, chunk_name, gold_rank) per retrieved chunk, in
+    # retrieval order. source != instance_id => cross-instance "foreign" hit.
+    retrieved_chunks: list
+    own_chunk_total: int          # gold chunks the queried instance actually has
 
 
 @dataclasses.dataclass
@@ -157,6 +166,9 @@ def _build_query_specs(
             block_size=args.block_size,
         )
         chunks_total = sum(len(e.token_ids) for e in retrieved)
+        retrieved_chunks = [
+            (e.instance_id, e.chunk_name, e.gold_rank) for e in retrieved
+        ]
 
         specs.append(
             QuerySpec(
@@ -167,6 +179,8 @@ def _build_query_specs(
                 reuse_params=reuse_params,
                 sys_len_padded=sys_len_padded,
                 chunks_total=chunks_total,
+                retrieved_chunks=retrieved_chunks,
+                own_chunk_total=len(inst.get("chunks", {})),
             )
         )
     return specs
@@ -288,6 +302,15 @@ def _bench_for_r(
     )
 
     # Vanilla passes no reuse_plan; sparse-Q runs pass the connector params.
+    # No stop sequence, deliberately. A bare stop=["\n\n"] was tried to cut the
+    # no-EOS degeneration tail, but that tail's real cause was distractor chunks
+    # pulled in by an oversized top_k: the model recited them in a runaway
+    # "Question?\n\nAnswer:" loop. Right-sizing top_k removes the distractors,
+    # EOS fires normally, and the loop disappears. The stop then only ever fired
+    # on legit answers shaped "Here's the answer:\n\n<content>", truncating them
+    # (sometimes to nothing) — net harmful. max_tokens caps any real runaway,
+    # and at low r the residual degeneration is genuine signal the sweep should
+    # surface rather than mask.
     def _sampling(max_tokens: int) -> SamplingParams:
         kwargs: dict = {"max_tokens": max_tokens, "temperature": 0.0}
         return kwargs
@@ -395,6 +418,50 @@ def _print_report(
             f"(sys={spec.sys_len_padded} + chunks={spec.chunks_total} "
             f"+ query={query_len})  gold={len(spec.gold_text.split()):>3} words"
         )
+
+    # ---- Retrieval hygiene ----
+    # Each retrieved chunk carries its source instance_id; a chunk whose source
+    # != the queried instance is a cross-instance "foreign" hit that pollutes
+    # the prompt (the root cause behind the all-columns-wrong instances).
+    # own/topk = how many retrieved chunks belong to the queried instance;
+    # goldcov = own retrieved / the instance's own gold-chunk total.
+    print(
+        "\nRetrieval hygiene per instance "
+        "(own = chunk's source IS the queried instance; * = foreign):"
+    )
+    print(
+        f"  {'instance':<16}{'own/topk':>9}{'goldcov':>9}  "
+        "chunks  (chunk(gold_rank); foreign shown as src:chunk*)"
+    )
+    tot_own = tot_k = tot_foreign = n_clean = 0
+    for spec in query_specs:
+        qid = spec.instance_id
+        own = 0
+        cells = []
+        for src, cname, grank in spec.retrieved_chunks:
+            if src == qid:
+                own += 1
+                cells.append(f"{cname}(g{grank})")
+            else:
+                short = src.replace("instance_", "")
+                cells.append(f"{short}:{cname}(g{grank})*")
+        k = len(spec.retrieved_chunks)
+        foreign = k - own
+        tot_own += own
+        tot_k += k
+        tot_foreign += foreign
+        n_clean += foreign == 0
+        cov = (own / spec.own_chunk_total) if spec.own_chunk_total else 0.0
+        print(
+            f"  {qid:<16}{f'{own}/{k}':>9}{f'{cov * 100:.0f}%':>9}  "
+            + " ".join(cells)
+        )
+    pct_own = (tot_own / tot_k * 100) if tot_k else 0.0
+    print(
+        f"  {'TOTAL':<16}{f'{tot_own}/{tot_k}':>9}{f'{pct_own:.0f}%':>9}  "
+        f"clean (0 foreign): {n_clean}/{len(query_specs)} instances; "
+        f"foreign chunks total: {tot_foreign}"
+    )
 
     header_cells = [f"r={r}" for r in r_values]
 
@@ -585,19 +652,30 @@ def _print_recovery(
 
     print("\n" + "-" * 100)
     print("Recovery per (intermediate r, instance)")
-    print(
-        "  recovery_metric(r) = (q(r) - q_stale) / (q_gold - q_stale)"
-    )
-    print(
-        "  1.0  hybrid matches gold (full quality with partial recompute)"
-    )
-    print("  0.0  hybrid no better than stale (selection didn't help)")
-    print("  >1.0 hybrid better than gold (rare; lucky paraphrasing)")
-    print("  <0   hybrid worse than stale (bad strategy)")
-    print(
-        "  N/A  endpoints collapsed (q_stale ≈ q_gold) — recovery undefined"
-    )
+    print("  recovery(r) = (q(r) - q_stale) / (q_gold - q_stale)   "
+          "[q_gold=r1.0, q_stale=r0.0; higher q = better]")
+    print("  Per-instance rows use that instance's OWN gold/stale gap as the "
+          "denominator:")
+    print("    1.0 matches gold   0.0 no better than stale   "
+          ">1.0 better than gold (lucky)   <0 worse than stale")
+    print("    N/A  this instance's gold ≈ stale (gap < 1e-9)")
+    print("  Summary rows aggregate ACROSS instances three ways:")
+    print("    MoR       mean of per-instance ratios — OUTLIER-PRONE: one "
+          "near-zero gap (gap≈0.001")
+    print("              -> ratio≈100) dominates the average. Shown only for "
+          "contrast.")
+    print("    RoMean    ratio-of-means:   "
+          "(mean q(r)   - mean q_stale)   / (mean q_gold   - mean q_stale)")
+    print("    RoMedian  ratio-of-medians: "
+          "(median q(r) - median q_stale) / (median q_gold - median q_stale)")
+    print("  RoMean/RoMedian never divide per-instance, so they never blow up; "
+          "but when the")
+    print("  aggregate gap is tiny the ratio is still sensitive — always read "
+          "the gap row.")
     print("-" * 100)
+
+    def _fmt(x: float | None) -> str:
+        return f"{x:>11.3f} " if x is not None else f"{'N/A':>12}"
 
     for metric_name, getter in [
         ("ROUGE-L", lambda m: m.rouge_l),
@@ -608,29 +686,62 @@ def _print_recovery(
             f"  {'instance':<20}"
             + "".join(f"{f'r={r}':>12}" for r in intermediate)
         )
-        sum_rec: dict[float, float] = defaultdict(float)
-        cnt_rec: dict[float, int] = defaultdict(int)
+
+        # Per-r column of per-instance values (gold = r1.0, stale = r0.0).
+        cols = {
+            r: [getter(results[r][i]) for i in range(len(query_specs))]
+            for r in ([0.0, 1.0] + intermediate)
+        }
+        gold, stale = cols[1.0], cols[0.0]
+
+        # Per-instance table + mean-of-ratios accumulator (the unstable one).
+        mor_sum: dict[float, float] = defaultdict(float)
+        mor_cnt: dict[float, int] = defaultdict(int)
         for i, spec in enumerate(query_specs):
             row = f"  {spec.instance_id:<20}"
-            q_gold = getter(results[1.0][i])
-            q_stale = getter(results[0.0][i])
+            denom_i = gold[i] - stale[i]
             for r in intermediate:
-                q_hyb = getter(results[r][i])
-                denom = q_gold - q_stale
-                if abs(denom) < 1e-9:
+                if abs(denom_i) < 1e-9:
                     row += f"{'N/A':>12}"
                     continue
-                rec = (q_hyb - q_stale) / denom
-                sum_rec[r] += rec
-                cnt_rec[r] += 1
+                rec = (cols[r][i] - stale[i]) / denom_i
+                mor_sum[r] += rec
+                mor_cnt[r] += 1
                 row += f"{rec:>11.3f} "
             print(row)
-        print(f"  {'AVG':<20}", end="")
+
+        # Aggregate anchors — the gap tells you whether recovery is meaningful.
+        mean_gold, mean_stale = statistics.fmean(gold), statistics.fmean(stale)
+        med_gold, med_stale = statistics.median(gold), statistics.median(stale)
+        print(f"  {'anchor gold r=1.0':<20}  "
+              f"mean={mean_gold:.3f}  median={med_gold:.3f}")
+        print(f"  {'anchor stale r=0.0':<20}  "
+              f"mean={mean_stale:.3f}  median={med_stale:.3f}")
+        print(f"  {'gap (gold-stale)':<20}  "
+              f"mean={mean_gold - mean_stale:+.3f}  "
+              f"median={med_gold - med_stale:+.3f}")
+
+        # Three summary recovery rows.
+        denom_mean = mean_gold - mean_stale
+        denom_med = med_gold - med_stale
+
+        print(f"  {'MoR (unstable)':<20}", end="")
         for r in intermediate:
-            if cnt_rec[r]:
-                print(f"{sum_rec[r] / cnt_rec[r]:>11.3f} ", end="")
-            else:
-                print(f"{'N/A':>12}", end="")
+            print(_fmt(mor_sum[r] / mor_cnt[r] if mor_cnt[r] else None), end="")
+        print()
+
+        print(f"  {'RoMean':<20}", end="")
+        for r in intermediate:
+            rm = ((statistics.fmean(cols[r]) - mean_stale) / denom_mean
+                  if abs(denom_mean) > 1e-9 else None)
+            print(_fmt(rm), end="")
+        print()
+
+        print(f"  {'RoMedian':<20}", end="")
+        for r in intermediate:
+            rmd = ((statistics.median(cols[r]) - med_stale) / denom_med
+                   if abs(denom_med) > 1e-9 else None)
+            print(_fmt(rmd), end="")
         print()
 
 
