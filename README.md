@@ -409,31 +409,162 @@ quality.
     --r_values 1.0,0.75,0.5,0.25,0.0
 ```
 
-**Methodology.** For each `(r, query)` it makes two `generate` calls:
+**Methodology.** For each `(r, query)` it makes one `generate` call over the
+production `sys + chunks + query` prompt with `max_tokens=128`. TTFT is read from vLLM's request metrics.
 
-1. **TTFT call** (`max_tokens=1`) over the production `sys + chunks + query`
-   prompt — sparse-Q activates here, so the wall-clock is the latency a real
-   user would see, and it leaves the `r`-specific chunk K/V in the cache.
-2. **Generation call** (`max_tokens=128`) over the same prompt — the prefix
-   cache hits the prefill, so this measures the quality of text produced from
-   the `r`-specific cache state end-to-end.
+Quality is measured on the generated text with an LLM-as-judge factual score.
+The judge compares each candidate answer against the query's gold answer and
+assigns an integer score from `0` to `5`, where `5` means fully factually
+correct.
 
-Quality uses two complementary metrics on the *generated* text:
+### LLM-as-judge result: Llama-3-8B + oracle retrieval
 
-- **ROUGE-L** (lexical) — catches single-token factual flips.
-- **Embedding cosine similarity** (semantic).
+The following run evaluates `bench_prefill.py` generations with an LLM factual
+judge:
 
-and a **recovery** score that normalises each metric between the pure-reuse and
-full-recompute endpoints:
-
+```bash
+.venv/bin/python examples/personal_context/bench_prefill.py \
+    --model meta-llama/Meta-Llama-3-8B-Instruct \
+    --data examples/personal_context/sample_data.jsonl \
+    --top_k 8 \
+    --oracle_retrieval \
+    --r_values 0.4,0.3,0.2,0.1,0.0
 ```
-recovery(r) = (q(r) − q@r=0.0) / (q@r=1.0 − q@r=0.0)
+
+- **Dataset:** [`examples/personal_context/sample_data.jsonl`](examples/personal_context/sample_data.jsonl)
+- **Retrieval:** oracle retrieval, `top_k=8`
+- **Judge:** GPT-5.5 Thinking, prompted as a strict factual judge
+- **Score:** integer `0-5`, where `5` is fully factually correct
+- **Quality loss:** relative drop from the vanilla mean judge score
+
+![Quality vs. latency trade-off across r values](docs/assets/features/personal_context/result-llama-8b.png)
+
+| variant | mean score (0-5) | quality loss | TTFT (ms) |
+| --- | ---: | ---: | ---: |
+| vanilla | 4.18 | 0.0% | 105.6 |
+| `r=0.4` | 3.83 | 8.4% | 82.0 |
+| `r=0.3` | 3.60 | 13.9% | 65.1 |
+| `r=0.2` | 3.50 | 16.3% | 64.0 |
+| `r=0.1` | 3.46 | 17.2% | 55.7 |
+| `r=0.0` | 3.45 | 17.5% | 50.8 |
+
+In this run, pure reuse (`r=0.0`) reduced TTFT from `105.6 ms` to `50.8 ms`
+while lowering the mean factual-judge score from `4.18` to `3.45`. Intermediate
+`r` values expose the expected latency / quality trade-off: higher recompute
+fractions recover more quality, while lower recompute fractions reduce TTFT.
+
+<details>
+<summary>LLM-as-judge prompt</summary>
+
+```text
+You are a strict, impartial FACTUAL JUDGE for a personal-assistant Q&A system.
+
+INPUT FORMAT
+I will paste one or more blocks in this format:
+[instance_XXX]
+Query: <the user's question>
+Gold: <the verified ground-truth answer>
+<variant> (rougeL=.., cos=..)
+<candidate answer>
+...more variants...
+
+Each block has ONE Query, ONE Gold, and several CANDIDATE answers labelled "vanilla"
+and "r=<number>" (e.g. r=1.0, r=0.5, r=0.0) — different system answers to the SAME
+query. Judge EACH candidate independently against that block's Gold and Query.
+IGNORE the (rougeL=.., cos=..) numbers — they are not ground truth.
+
+RULES
+1. Gold is the ONLY source of truth. Judge factual correctness of what the Query asks
+   for — not grammar, style, tone, or length.
+2. A candidate fact that CONTRADICTS Gold — wrong date, time, amount, name, place,
+   quantity, or a flipped yes/no — is a factual error (a "contradiction") and the most
+   serious problem.
+3. Treat formatting/paraphrase as EQUIVALENT, never errors: "$1,840"="$1840",
+   "May 16"="May 16th"="16 May", "9:30 AM"="9:30am", "Apr"="April", and any rewording
+   that preserves meaning. An approximation consistent with Gold ("about $1.8k" for
+   $1,840) is NOT a contradiction.
+4. Do NOT reward verbosity. A short answer that correctly states what the Query asks
+   for is fully correct. Count info as MISSING only if the Query asks for it and Gold
+   provides it.
+5. Extra details not in Gold: ignore if plausibly consistent; treat as an error only if
+   they contradict Gold or are clearly fabricated specifics (invented confirmation
+   number, made-up price, etc.).
+6. If a candidate is empty, refuses, is off-topic, or echoes the prompt/instructions
+   instead of answering, score 0 (this overrides everything below).
+
+KEY DEFINITIONS
+- CORE = the single headline fact the Query most centrally asks for (the yes/no, the
+  bottom-line number, the name/date asked).
+- QUERY-RELEVANT DETAIL = anything the Query also asks for AND Gold provides, beyond CORE.
+- ACTIONABLE value = a query-relevant number/date/name the user would act on (a payment
+  amount, an appointment time, a person to contact).
+- CONTRADICTION = a stated fact conflicting with Gold (rule 2). OMISSION = a
+  query-relevant detail simply absent or left vague, with nothing stated that conflicts
+  with Gold. A contradiction is ALWAYS worse than an omission of the same scope.
+
+SCORE (integer 0–5) — apply this decision procedure IN ORDER:
+First check rule 6 → if it applies, score 0.
+Else identify the CORE and ask: is the CORE correct (paraphrase-equivalent to Gold)?
+
+A) CORE correct → score 2–5:
+   5 = No contradiction anywhere AND no query-relevant detail missing.
+       (Concise-but-complete = 5.)
+   4 = No contradiction anywhere, but ONE minor query-relevant detail is missing/vague.
+   3 = EITHER no contradiction but a MAJOR query-relevant part is missing/unanswered,
+       OR exactly one minor/peripheral contradiction that does NOT touch an actionable value.
+   2 = CORE headline is right, but at least one ACTIONABLE value is contradicted
+       (wrong amount/date/name the user would act on), or there are multiple contradictions.
+
+B) CORE wrong, contradicted, or absent → score 0–1:
+   1 = CORE wrong/contradicted/non-committal, BUT some correct query-relevant fragment
+       is still present (partial salvage).
+   0 = CORE wrong with nothing salvageable, irrelevant, fabricated, or non-answering.
+
+has_error (boolean, ORTHOGONAL to the score):
+Set has_error = true if the candidate states ANYTHING that contradicts Gold — regardless
+of score. Typical pairings: 5 and 4 → always false; 2 → always true; 3 → true only on its
+"peripheral contradiction" branch (false on its "omission" branch); 1/0 → true if the core
+is contradicted, false if it merely refuses/omits/off-topics.
+
+CALIBRATION (sorted high→low to show the gradient)
+1. Q: total solar cost after federal credit? Gold: gross $32,400; 30% credit $9,720;
+   net $22,680. Candidate: "$22,680." → 5, has_error false
+   (CORE = net cost; correct and complete; breakdown not asked).
+2. Q: did Maria fix the login bug, and when? Gold: yes, merged Apr 23.
+   Candidate: "Yes, Maria fixed it." → 4, has_error false
+   (CORE yes correct; "when" is a minor query-relevant detail, omitted, nothing contradicted).
+3. Q: did Maria fix the bug (yes/no)? Gold: yes, merged Apr 23 by Maria.
+   Candidate: "Yes — Bob merged it Apr 23." → 3, has_error true
+   (CORE yes correct; "Bob" contradicts "Maria", but the Query only asked yes/no →
+   peripheral contradiction, not an actionable value).
+4. Q: when + how am I paying? Gold: Apr 24 8–10AM, out of pocket $480.
+   Candidate: "Apr 24 8–10AM." → 3, has_error false
+   (the "when" is right; the whole "how/how much" part is missing, nothing contradicted).
+5. Q: when + how am I paying? Gold: Apr 24 8–10AM, out of pocket $480.
+   Candidate: "Apr 24 8–10AM, you'll pay the $920 deductible." → 2, has_error true
+   (date right, but the actionable amount/framing contradicts Gold).
+6. Q: total cost after credit? Gold: net $22,680.
+   Candidate: "Not totally sure, but the gross is around $32,400." → 1, has_error false
+   (CORE net not given / non-committal, but a correct query-relevant fragment remains).
+7. Q: did Maria fix the bug? Gold: yes, merged Apr 23.
+   Candidate: "No, not fixed." → 0, has_error true (flipped yes/no on the central fact).
+
+OUTPUT — produce exactly these three sections:
+
+1) PER-INSTANCE SCORES — one line per instance, scores only:
+instance_XXX: vanilla=S r=1.0=S r=0.5=S ... r=0.0=S
+
+2) ERRORS — one bullet per (instance, variant) where has_error=true, with the contradiction:
+- instance_023 r=0.5: says $340 / $85 per family; gold says $1,440 / $360
+
+3) AGGREGATE — a markdown table, one row per variant, in the order they appear
+   (vanilla, r=1.0, r=0.5, …, r=0.0):
+| variant | n | mean_score (0–5) | % fully correct (=5) | % acceptable (≥4) | error_rate (% has_error) |
+
+Judge the blocks that follow:
 ```
 
-> The benchmark deliberately scores *generation*, not teacher-forced
-> perplexity: requesting `prompt_logprobs` disables prefix caching in vLLM,
-> which would prevent KV reuse from activating at all and collapse every `r` to
-> vanilla prefill.
+</details>
 
 ---
 
@@ -465,4 +596,3 @@ The support library has CPU-runnable unit tests plus CPU/GPU end-to-end tests:
   (a few "wasted" tokens).
 - **Block size must match** between the offline encoder and the serving engine
   (default 16).
-
