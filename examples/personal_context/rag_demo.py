@@ -127,7 +127,10 @@ class IndexEntry:
 # ----------------------- storage factory -----------------------
 
 
-def _build_kv_store(preset, block_size: int, backend: str, url: str):
+def _build_kv_store(
+    preset, block_size: int, backend: str, url: str,
+    dtype: torch.dtype = torch.float16,
+):
     """Build the encoder-side KV store matching the worker-side backend.
 
     Worker-side connector chooses its own backend from
@@ -137,7 +140,7 @@ def _build_kv_store(preset, block_size: int, backend: str, url: str):
     store; for ``redis`` that's the Redis URL, for ``mmap`` it's the
     on-disk directory (``url``), for ``memory`` it's the pickle bridge.
     """
-    cfg = store_config_for(preset, block_size=block_size)
+    cfg = store_config_for(preset, block_size=block_size, dtype=dtype)
     if backend == "memory":
         return InMemoryStorage(cfg)
     if backend == "redis":
@@ -186,6 +189,7 @@ class RAGIndex:
         device: str = "cuda",
         store_backend: str = "memory",
         store_url: str = DEFAULT_REDIS_URL,
+        dtype: torch.dtype = torch.float16,
     ):
         # faiss is validated lazily in build_faiss() (the only place it's
         # used), so oracle-retrieval runs that never retrieve need no faiss.
@@ -205,10 +209,11 @@ class RAGIndex:
         # Lazy model load — defer ~30s of HF model loading until the
         # first cache miss. Tokenizer loads up-front (needed for cache
         # hit checks even on full-warm runs).
+        self.dtype = dtype
         self.encoder = HFChunkEncoder(
             preset=preset,
             device=device,
-            dtype=torch.float16,
+            dtype=dtype,
             lazy_model=True,
         )
         self.tokenizer = self.encoder.tokenizer
@@ -226,6 +231,7 @@ class RAGIndex:
             block_size=block_size,
             backend=store_backend,
             url=store_url,
+            dtype=dtype,
         )
         self.entries: list[IndexEntry] = []
         self.faiss_index: Any = None

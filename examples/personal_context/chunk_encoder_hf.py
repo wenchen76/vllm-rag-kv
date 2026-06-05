@@ -91,6 +91,16 @@ LLAMA_3_8B_INSTRUCT = ModelPreset(
     rope_theta=500000.0,
 )
 
+# Qwen2.5 standard 32K context (no YaRN -> rope_type "default", valid for
+# apply_delta_rope). bf16-native: run with --dtype bfloat16 (fp16 can NaN).
+QWEN_2_5_32B_INSTRUCT = ModelPreset(
+    hf_id="Qwen/Qwen2.5-32B-Instruct",
+    num_layers=64,
+    num_kv_heads=8,
+    head_dim=128,
+    rope_theta=1000000.0,
+)
+
 # NOTE: Meta-Llama-3.1 / 3.2 series are intentionally NOT listed here.
 # They ship with ``rope_scaling = {"rope_type": "llama3", ...}`` to
 # extend context to 128K via NTK-style piecewise frequency rescaling.
@@ -109,6 +119,7 @@ KNOWN_PRESETS: dict[str, ModelPreset] = {
         QWEN_2_5_0_5B_INSTRUCT,
         QWEN_2_5_1_5B_INSTRUCT,
         LLAMA_3_8B_INSTRUCT,
+        QWEN_2_5_32B_INSTRUCT,
     )
 }
 
@@ -133,10 +144,14 @@ def preset_for(hf_id: str) -> ModelPreset:
         ) from e
 
 
-def store_config_for(preset: ModelPreset, block_size: int = 16) -> StoreConfig:
+def store_config_for(
+    preset: ModelPreset,
+    block_size: int = 16,
+    dtype: torch.dtype = torch.float16,
+) -> StoreConfig:
     return StoreConfig(
         model_id=preset.hf_id,
-        dtype=torch.float16,
+        dtype=dtype,
         layout="NHD",
         num_layers=preset.num_layers,
         num_kv_heads=preset.num_kv_heads,

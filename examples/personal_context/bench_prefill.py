@@ -298,7 +298,7 @@ def _bench_for_r(
     )
     llm = LLM(
         model=args.model,
-        dtype="float16",
+        dtype=args.dtype,
         block_size=args.block_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=True,
@@ -847,6 +847,15 @@ def main() -> None:
         default=0.85,
         help="vLLM gpu_memory_utilization (each LLM boot).",
     )
+    parser.add_argument(
+        "--dtype",
+        choices=["float16", "bfloat16"],
+        default="float16",
+        help="Model + KV-store dtype. Use bfloat16 for bf16-native models "
+        "(Qwen2.5) where fp16 can overflow to NaN. Drives the encoder, the KV "
+        "store, AND vLLM, so the stored KV matches what the worker computes "
+        "(switch dtype => use a fresh --store_url).",
+    )
     args = parser.parse_args()
 
     # Resolve the per-backend default store_url when omitted, so
@@ -884,6 +893,7 @@ def main() -> None:
         device="cuda",
         store_backend=args.store_backend,
         store_url=args.store_url,
+        dtype=getattr(torch, args.dtype),
     )
     index.ingest_instances(instances)
     if not args.oracle_retrieval:
