@@ -76,7 +76,7 @@ HFChunkEncoder  ── runs the target model on the chunk in isolation
   │              harvests past_key_values, slices per block,
   │              permutes to NHD layout
   ▼
-per-block (content_hash → KVBlock)   ──►  KV store (Redis)
+per-block (content_hash → KVBlock)   ──►  KV store (mmap)
                                           + vector  ──► vector DB
 ```
 
@@ -140,7 +140,7 @@ uv venv --python 3.12
 source .venv/bin/activate
 VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto
 
-# Add the personal-context extras (vector DB, embeddings, Redis, scoring):
+# Add the personal-context extras (vector DB, embeddings, mmap backend, scoring):
 uv pip install -e ".[personal-context]"
 ```
 
@@ -150,14 +150,13 @@ The `personal-context` extra pulls in:
 | --- | --- | --- |
 | `faiss-cpu>=1.8.0` | Demo | Vector DB for the example's retrieval index |
 | `sentence-transformers>=3.0.0` | Demo | Query/chunk embeddings for retrieval |
-| `redis>=5.0.0` | Store backend | Optional cross-process KV store (`store_backend=redis`) |
-| `fakeredis>=2.20.0` | Tests | In-process Redis for unit tests |
+| Python stdlib `mmap` | Store backend | Optional same-host cross-process KV store (`store_backend=mmap`) |
 | `rouge-score>=0.1.2` | Benchmark | ROUGE-L quality scoring |
 
 None of these are required by the core connector or the
 `vllm.v1.personal_context` library itself — with the default in-memory store it
 imports nothing beyond vLLM/torch. They exist only to run the **demo**
-(`faiss-cpu` + `sentence-transformers` drive retrieval), the optional Redis store
+(`faiss-cpu` + `sentence-transformers` drive retrieval), the optional mmap store
 backend, and the tests/benchmark.
 
 A CUDA GPU is required to run the demos/benchmarks (they boot a real vLLM
@@ -179,20 +178,19 @@ The demo ingests `sample_data.jsonl`, builds a vector DB index, reports retrieva
 quality against the labelled gold chunks, then runs the augmented prompt through
 vLLM with KV reuse and prints the generated answer next to the gold answer.
 
-### With a Redis-backed store (cross-process)
+### With an mmap-backed store (same-host cross-process)
 
 ```bash
-docker run -d --name pc-redis -p 6379:6379 redis:7
-
 .venv/bin/python examples/personal_context/rag_demo.py \
     --model meta-llama/Meta-Llama-3-8B-Instruct \
-    --store_backend redis \
-    --store_url redis://localhost:6379
+    --store_backend mmap \
+    --store_url /tmp/pc_mmap
 ```
 
-In Redis mode the encoded blocks live in Redis and the vLLM worker pulls them in
-via `kv_connector_extra_config` — the same path a real deployment would use,
-where ingestion and serving are separate processes.
+In mmap mode the encoded blocks live in a memory-mapped on-disk store and the
+vLLM worker pulls them in via `kv_connector_extra_config` — the same path a
+same-host deployment would use when ingestion and serving are separate
+processes.
 
 ---
 
@@ -208,8 +206,8 @@ where ingestion and serving are separate processes.
 | `--selector_r` | `1.0` | Fraction of each chunk to recompute (sparse-Q). `1.0` = full recompute (lossless), `0.0` = pure reuse. |
 | `--max_tokens` | `128` | Tokens generated per query. |
 | `--embedder` | `sentence-transformers/all-MiniLM-L6-v2` | Retrieval embedding model. |
-| `--store_backend` | `memory` | `memory` or `redis`. |
-| `--store_url` | `redis://localhost:6379` | Redis URL (redis backend only). |
+| `--store_backend` | `mmap` | `mmap` or `memory` or `redis`. |
+| `--store_url` | `/tmp/pc_mmap` | mmap directory (mmap backend only). |
 | `--gpu_memory_utilization` | `0.85` | vLLM VRAM fraction. |
 
 ### Programmatic API
@@ -229,8 +227,8 @@ kv_transfer_config = KVTransferConfig(
     kv_connector_extra_config={
         "selector": {"type": "SelectFirstR", "r": 0.8},
         # Optional cross-process store:
-        "store_backend": "redis",
-        "store_url": "redis://localhost:6379",
+        "store_backend": "mmap",
+        "store_url": "/tmp/pc_mmap",
     },
 )
 
@@ -370,12 +368,13 @@ All knobs live in `KVTransferConfig.kv_connector_extra_config`.
 
 | key | values |
 | --- | --- |
-| `store_backend` | `"redis"` to bind a `RedisKVStorage` (schema auto-verified on connect). Omit for the in-process path. |
-| `store_url` | e.g. `redis://localhost:6379` (required when `store_backend="redis"`). |
+| `store_backend` | `"mmap"` to bind a `MmapKVStorage` (schema auto-verified on connect). Omit for the in-process path. |
+| `store_url` | e.g. `/tmp/pc_mmap` (required when `store_backend="mmap"`). |
 
 > For tests and the in-memory demo path, a populated `InMemoryStorage` is
 > pickled to the worker via the `VLLM_PERSONAL_CONTEXT_TEST_BIND` env var. This is
-> a test/dev channel, not a production mechanism — use Redis for cross-process.
+> a test/dev channel, not a production mechanism — use mmap for cross-process
+> same-host sharing.
 
 ---
 
@@ -403,12 +402,6 @@ Add a model by declaring a `ModelPreset` and appending it to `KNOWN_PRESETS`.
 `bench_prefill.py` sweeps the recompute knob `r` and reports TTFT and generation
 quality.
 
-```bash
-.venv/bin/python examples/personal_context/bench_prefill.py \
-    --model meta-llama/Meta-Llama-3-8B-Instruct \
-    --r_values 1.0,0.75,0.5,0.25,0.0
-```
-
 **Methodology.** For each `(r, query)` it makes one `generate` call over the
 production `sys + chunks + query` prompt with `max_tokens=128`. TTFT is read from vLLM's request metrics.
 
@@ -427,6 +420,7 @@ judge:
     --model meta-llama/Meta-Llama-3-8B-Instruct \
     --data examples/personal_context/sample_data.jsonl \
     --top_k 8 \
+    --store_backend mmap \
     --oracle_retrieval \
     --r_values 0.4,0.3,0.2,0.1,0.0
 ```
