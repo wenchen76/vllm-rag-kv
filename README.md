@@ -8,8 +8,9 @@ a knowledge-base passage) are fed back into the model on *every* request, and
 vLLM re-prefills them from scratch every time. Prefill is the expensive part of
 a RAG turn — it dominates **time-to-first-token (TTFT)**. This project encodes
 each chunk's key/value tensors **once, offline**, stores them in a
-content-addressed KV store, and **scatters them straight into vLLM's paged KV
-cache** at query time so the model never recomputes them.
+content-addressed KV store, optionally with int8 quantization, and **scatters
+them straight into vLLM's paged KV cache** at query time so the model never
+recomputes them.
 
 The result is a drop-in `KVConnectorBase_V1` implementation
 (`PersonalContextKVConnector`) plus a small, fully-tested support library
@@ -106,11 +107,11 @@ vLLM.generate(prompt, kv_transfer_params={"reuse_plan": …})
                 chunk-aware prefill       forward only those positions
 ```
 
-The two non-obvious pieces are **delta-RoPE** (re-rotating a chunk's stored K
-from its encoding position to wherever it lands in the new prompt) and
-**sparse-Q selective recompute** (recomputes only a
-fraction `r` of each chunk to trade quality against prefill cost). Both are
-covered in the [deep dive](#technical-deep-dive).
+The non-obvious pieces are **delta-RoPE** (re-rotating a chunk's stored K from
+its encoding position to wherever it lands in the new prompt),
+**sparse-Q selective recompute** (recomputes only a fraction `r` of each chunk
+to trade quality against prefill cost), and optional **int8 KV storage
+quantization**. All are covered in the [deep dive](#technical-deep-dive).
 
 ---
 
@@ -120,6 +121,7 @@ covered in the [deep dive](#technical-deep-dive).
 | --- | --- |
 | `vllm/v1/personal_context/` | The support library: hashing, storage, delta-RoPE, load, scatter, selection, chunk-aware prefill, cache-isolation policy. ~1.3k LoC, fully unit-tested. |
 | `vllm/distributed/kv_transfer/kv_connector/v1/personal_context_connector.py` | `PersonalContextKVConnector` — the vLLM-facing `KVConnectorBase_V1` glue (~1.1k LoC). Registered in the connector `factory.py`. |
+| `vllm/v1/personal_context/quant.py` | Optional per-tensor int8 quantization for stored chunk K/V blocks. |
 | `examples/personal_context/rag_demo.py` | End-to-end RAG demo: ingest a JSONL corpus, retrieve from a vector DB, generate with KV reuse. |
 | `examples/personal_context/chunk_encoder_hf.py` | Offline chunk→KVBlock encoder backed by HuggingFace transformers; model presets. |
 | `examples/personal_context/bench_prefill.py` | TTFT + generation-quality benchmark sweeping the selective-recompute knob `r`. |
@@ -208,6 +210,8 @@ processes.
 | `--embedder` | `sentence-transformers/all-MiniLM-L6-v2` | Retrieval embedding model. |
 | `--store_backend` | `mmap` | `mmap` or `memory` or `redis`. |
 | `--store_url` | `/tmp/pc_mmap` | mmap directory (mmap backend only). |
+| `--dtype` | `float16` | Model and KV compute dtype. Use a fresh `--store_url` when changing it. |
+| `--kv_quant` | off | Store chunk K/V as int8 with per-tensor scales; dequantizes to `--dtype` before delta-RoPE. |
 | `--gpu_memory_utilization` | `0.85` | vLLM VRAM fraction. |
 
 ### Programmatic API
@@ -229,6 +233,8 @@ kv_transfer_config = KVTransferConfig(
         # Optional cross-process store:
         "store_backend": "mmap",
         "store_url": "/tmp/pc_mmap",
+        # Optional int8 KV storage quantization:
+        "quant": "int8",
     },
 )
 
@@ -331,7 +337,16 @@ A mixed-KV request (one carrying a `reuse_plan`) must **never** write its blocks
 back into vLLM's position-dependent prefix cache: a later request sharing that
 prefix would then read K rotated for the wrong position.
 
-### 5. Connector lifecycle
+### 5. Optional int8 KV storage quantization
+
+Chunk K/V can be stored as per-tensor symmetric int8 by passing `--kv_quant` in
+the demos/benchmarks or `"quant": "int8"` in `kv_connector_extra_config`.
+The offline encoder writes int8 tensors plus one scale per K/V tensor; the
+worker dequantizes them back to the model compute dtype before delta-RoPE and
+scatter. This reduces the mmap store footprint by roughly 2x versus fp16/bf16,
+at the cost of approximate KV reuse quality.
+
+### 6. Connector lifecycle
 
 `PersonalContextKVConnector` implements the `KVConnectorBase_V1` contract:
 
@@ -370,6 +385,7 @@ All knobs live in `KVTransferConfig.kv_connector_extra_config`.
 | --- | --- |
 | `store_backend` | `"mmap"` to bind a `MmapKVStorage` (schema auto-verified on connect). Omit for the in-process path. |
 | `store_url` | e.g. `/tmp/pc_mmap` (required when `store_backend="mmap"`). |
+| `quant` | `"none"` or `"int8"`. Must match the encoder-side store config. |
 
 > For tests and the in-memory demo path, a populated `InMemoryStorage` is
 > pickled to the worker via the `VLLM_PERSONAL_CONTEXT_TEST_BIND` env var. This is
@@ -431,6 +447,8 @@ judge:
 - **Score:** integer `0-5`, where `5` is fully factually correct
 - **Quality loss:** relative drop from the vanilla mean judge score
 
+#### Unquantized mmap store
+
 ![Quality vs. latency trade-off across r values](docs/assets/features/personal_context/result-llama-8b.png)
 
 | variant | mean score (0-5) | quality loss | TTFT (ms) |
@@ -446,6 +464,26 @@ In this run, pure reuse (`r=0.0`) reduced TTFT from `105.6 ms` to `50.8 ms`
 while lowering the mean factual-judge score from `4.18` to `3.45`. Intermediate
 `r` values expose the expected latency / quality trade-off: higher recompute
 fractions recover more quality, while lower recompute fractions reduce TTFT.
+
+#### Int8-quantized mmap store (`--kv_quant`)
+
+The same setup with `--kv_quant` stores chunk K/V as int8 with per-tensor
+scales.
+
+![Quality vs. latency trade-off across r values with int8 KV storage](docs/assets/features/personal_context/result-llama-8b-quant-int8.png)
+
+| variant | mean score (0-5) | quality loss | TTFT (ms) |
+| --- | ---: | ---: | ---: |
+| vanilla | 4.14 | 0.0% | 110.4 |
+| `r=0.4` | 3.80 | 8.2% | 75.1 |
+| `r=0.3` | 3.54 | 14.5% | 57.5 |
+| `r=0.2` | 3.51 | 15.2% | 56.7 |
+| `r=0.1` | 3.55 | 14.3% | 49.4 |
+| `r=0.0` | 3.36 | 18.8% | 45.1 |
+
+In this int8 run, pure reuse (`r=0.0`) reduced TTFT from `110.4 ms` to
+`45.1 ms`, a `59.1%` TTFT reduction, while the mean factual-judge score moved
+from `4.14` to `3.36`. Across reuse settings (r=0.4 to r=0.0), int8 KV storage provided an average 10.8% additional TTFT gain over unquantized mmap storage, with negligible quality impact: the average LLM-judge score changed by only -0.016 points on a 0-5 scale.
 
 <details>
 <summary>LLM-as-judge prompt</summary>
