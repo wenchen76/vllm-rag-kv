@@ -340,6 +340,11 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
         )
         head_dim = hf_cfg.hidden_size // hf_cfg.num_attention_heads
 
+        # quant must match the encoder-side store (the worker reopens the same
+        # mmap/redis store and verifies the config). Driven by the same flag
+        # as the encoder via kv_connector_extra_config.
+        extra = self._kv_transfer_config.kv_connector_extra_config or {}
+
         return StoreConfig(
             model_id=model_cfg.model,
             dtype=model_cfg.dtype,
@@ -348,6 +353,7 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             block_size=self._block_size,
+            quant=extra.get("quant", "none"),
         )
 
     def _maybe_init_storage_from_config(self) -> None:
@@ -975,6 +981,9 @@ class PersonalContextKVConnector(KVConnectorBase_V1):
                 req_meta.new_pos_starts,
                 rope_theta=self._rope_theta,
                 device=load_device,
+                compute_dtype=(
+                    kv_caches[0].dtype if kv_caches else torch.float16
+                ),
             )
             if _time_load:
                 _sync()

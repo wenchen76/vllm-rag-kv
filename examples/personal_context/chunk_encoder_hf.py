@@ -44,6 +44,7 @@ from vllm.v1.personal_context import (
     KVBlock,
     StoreConfig,
 )
+from vllm.v1.personal_context.quant import QUANT_INT8, quantize_int8
 
 
 # ----------------------------- model presets -----------------------------
@@ -148,6 +149,7 @@ def store_config_for(
     preset: ModelPreset,
     block_size: int = 16,
     dtype: torch.dtype = torch.float16,
+    quant: str = "none",
 ) -> StoreConfig:
     return StoreConfig(
         model_id=preset.hf_id,
@@ -157,6 +159,7 @@ def store_config_for(
         num_kv_heads=preset.num_kv_heads,
         head_dim=preset.head_dim,
         block_size=block_size,
+        quant=quant,
     )
 
 
@@ -175,6 +178,7 @@ class HFChunkEncoder:
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
         lazy_model: bool = False,
+        quant: str = "none",
     ):
         """
         Args:
@@ -199,6 +203,7 @@ class HFChunkEncoder:
         self.preset = preset
         self.device = device
         self.dtype = dtype
+        self.quant = quant
         # Tokenizer is always loaded (small, ~10MB cached) — callers
         # need it to compute block hashes for cache hit checks before
         # deciding whether to pay the model load cost.
@@ -386,16 +391,34 @@ class HFChunkEncoder:
                 keys_per_layer.append(k_slice)
                 values_per_layer.append(v_slice)
 
-            entries.append(
-                (
-                    block_hash,
-                    KVBlock(
-                        keys=keys_per_layer,
-                        values=values_per_layer,
-                        old_pos_start=old_pos_start + block_start,
-                    ),
+            if self.quant == QUANT_INT8:
+                # Per-tensor int8 + scales; dequantized in load_plan before
+                # delta-RoPE. Stored ~2x smaller than fp16/bf16.
+                k_q: list[torch.Tensor] = []
+                v_q: list[torch.Tensor] = []
+                k_scales: list[float] = []
+                v_scales: list[float] = []
+                for kt, vt in zip(keys_per_layer, values_per_layer):
+                    q, s = quantize_int8(kt)
+                    k_q.append(q)
+                    k_scales.append(s)
+                    q, s = quantize_int8(vt)
+                    v_q.append(q)
+                    v_scales.append(s)
+                block = KVBlock(
+                    keys=k_q,
+                    values=v_q,
+                    old_pos_start=old_pos_start + block_start,
+                    k_scales=k_scales,
+                    v_scales=v_scales,
                 )
-            )
+            else:
+                block = KVBlock(
+                    keys=keys_per_layer,
+                    values=values_per_layer,
+                    old_pos_start=old_pos_start + block_start,
+                )
+            entries.append((block_hash, block))
         return chunk, entries
 
     def encode_text(

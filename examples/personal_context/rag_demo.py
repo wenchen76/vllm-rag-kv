@@ -130,6 +130,7 @@ class IndexEntry:
 def _build_kv_store(
     preset, block_size: int, backend: str, url: str,
     dtype: torch.dtype = torch.float16,
+    quant: str = "none",
 ):
     """Build the encoder-side KV store matching the worker-side backend.
 
@@ -140,7 +141,9 @@ def _build_kv_store(
     store; for ``redis`` that's the Redis URL, for ``mmap`` it's the
     on-disk directory (``url``), for ``memory`` it's the pickle bridge.
     """
-    cfg = store_config_for(preset, block_size=block_size, dtype=dtype)
+    cfg = store_config_for(
+        preset, block_size=block_size, dtype=dtype, quant=quant
+    )
     if backend == "memory":
         return InMemoryStorage(cfg)
     if backend == "redis":
@@ -190,6 +193,7 @@ class RAGIndex:
         store_backend: str = "memory",
         store_url: str = DEFAULT_REDIS_URL,
         dtype: torch.dtype = torch.float16,
+        quant: str = "none",
     ):
         # faiss is validated lazily in build_faiss() (the only place it's
         # used), so oracle-retrieval runs that never retrieve need no faiss.
@@ -210,11 +214,13 @@ class RAGIndex:
         # first cache miss. Tokenizer loads up-front (needed for cache
         # hit checks even on full-warm runs).
         self.dtype = dtype
+        self.quant = quant
         self.encoder = HFChunkEncoder(
             preset=preset,
             device=device,
             dtype=dtype,
             lazy_model=True,
+            quant=quant,
         )
         self.tokenizer = self.encoder.tokenizer
         # Cache hit/miss counters, reset per ingest_instances() call.
@@ -232,6 +238,7 @@ class RAGIndex:
             backend=store_backend,
             url=store_url,
             dtype=dtype,
+            quant=quant,
         )
         self.entries: list[IndexEntry] = []
         self.faiss_index: Any = None
@@ -621,6 +628,21 @@ def main() -> None:
             "can drop to 0.6 to leave room for other GPU users."
         ),
     )
+    parser.add_argument(
+        "--dtype",
+        choices=["float16", "bfloat16"],
+        default="float16",
+        help="Model + KV-store dtype. Use bfloat16 for bf16-native models "
+        "(Qwen2.5) where fp16 can NaN. Drives encoder, store, and vLLM "
+        "(switch dtype => use a fresh --store_url).",
+    )
+    parser.add_argument(
+        "--kv_quant",
+        action="store_true",
+        help="Store chunk KV as int8 (per-tensor scales), dequantized to "
+        "--dtype before delta-RoPE. ~2x smaller store; switch on/off => use "
+        "a fresh --store_url.",
+    )
     args = parser.parse_args()
 
     # Resolve the per-backend default store_url when the flag was omitted,
@@ -647,6 +669,8 @@ def main() -> None:
         device="cuda",
         store_backend=args.store_backend,
         store_url=args.store_url,
+        dtype=getattr(torch, args.dtype),
+        quant="int8" if args.kv_quant else "none",
     )
     index.ingest_instances(instances)
     index.build_faiss()
@@ -680,6 +704,9 @@ def main() -> None:
 
     extra: dict = {
         "selector": {"type": "SelectFirstR", "r": args.selector_r},
+        # Worker store must match the encoder's quant (it reopens the same
+        # mmap/redis store and verifies the config).
+        "quant": "int8" if args.kv_quant else "none",
     }
     if args.store_backend in ("redis", "mmap"):
         extra["store_backend"] = args.store_backend
@@ -699,7 +726,7 @@ def main() -> None:
     with worker_bind_ctx:
         llm = LLM(
             model=preset.hf_id,
-            dtype="float16",
+            dtype=args.dtype,
             block_size=16,
             gpu_memory_utilization=args.gpu_memory_utilization,
             enforce_eager=True,

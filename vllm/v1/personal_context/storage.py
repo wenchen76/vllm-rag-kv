@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+import torch
+
 from vllm.v1.personal_context.chunk import AlignmentError
 from vllm.v1.personal_context.entry import KVBlock, StoreConfig
 
@@ -50,6 +52,9 @@ def validate_block(config: StoreConfig, block: KVBlock) -> None:
             f"KVBlock.old_pos_start {block.old_pos_start} is not a "
             f"non-negative multiple of block_size {config.block_size}"
         )
+    # When quant="int8" the stored tensors are int8 (config.dtype stays the
+    # compute/dequant dtype); otherwise they are config.dtype.
+    storage_dtype = torch.int8 if config.quant == "int8" else config.dtype
     expected = (config.block_size, config.num_kv_heads, config.head_dim)
     for layer_idx, (k, v) in enumerate(zip(block.keys, block.values)):
         if tuple(k.shape) != expected:
@@ -62,11 +67,22 @@ def validate_block(config: StoreConfig, block: KVBlock) -> None:
                 f"KVBlock layer {layer_idx} V shape {tuple(v.shape)}, "
                 f"expected {expected}"
             )
-        if k.dtype != config.dtype or v.dtype != config.dtype:
+        if k.dtype != storage_dtype or v.dtype != storage_dtype:
             raise ValueError(
                 f"KVBlock layer {layer_idx} dtype K={k.dtype} V={v.dtype}, "
-                f"expected {config.dtype}"
+                f"expected {storage_dtype} (quant={config.quant})"
             )
+    if config.quant == "int8":
+        if block.k_scales is None or block.v_scales is None:
+            raise ValueError("quant=int8 requires k_scales and v_scales")
+        if (len(block.k_scales) != config.num_layers
+                or len(block.v_scales) != config.num_layers):
+            raise ValueError(
+                f"quant=int8 scales must have {config.num_layers} entries, got "
+                f"K={len(block.k_scales)} V={len(block.v_scales)}"
+            )
+    elif block.k_scales is not None or block.v_scales is not None:
+        raise ValueError("quant=none but KVBlock carries scales")
 
 
 class InMemoryStorage:

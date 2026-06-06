@@ -20,6 +20,10 @@ class StoreConfig:
     num_kv_heads: int
     head_dim: int
     block_size: int
+    # "none" (store K/V as ``dtype``) or "int8" (store per-tensor int8 +
+    # scales, dequantized to ``dtype`` in load_plan before delta-RoPE).
+    # ``dtype`` always remains the COMPUTE dtype (the dequant target).
+    quant: str = "none"
 
 
 @dataclass
@@ -36,3 +40,8 @@ class KVBlock:
     keys: list[torch.Tensor]
     values: list[torch.Tensor]
     old_pos_start: int
+    # When quantized (StoreConfig.quant=="int8"), keys/values are int8 and
+    # these hold the per-tensor dequant scales (one float per layer); both
+    # None for the unquantized fp16/bf16 case.
+    k_scales: list[float] | None = None
+    v_scales: list[float] | None = None

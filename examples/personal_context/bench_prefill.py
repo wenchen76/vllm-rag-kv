@@ -277,6 +277,9 @@ def _bench_for_r(
     if not is_vanilla:
         extra: dict = {
             "selector": {"type": "SelectFirstR", "r": r},
+            # Worker store must match the encoder's quant (it reopens the same
+            # mmap/redis store and verifies the config).
+            "quant": "int8" if args.kv_quant else "none",
         }
         # redis + mmap both let the worker build its own storage from the
         # connector config (pointing at the same Redis URL / mmap dir as
@@ -856,6 +859,13 @@ def main() -> None:
         "store, AND vLLM, so the stored KV matches what the worker computes "
         "(switch dtype => use a fresh --store_url).",
     )
+    parser.add_argument(
+        "--kv_quant",
+        action="store_true",
+        help="Store chunk KV as int8 (per-tensor scales), dequantized to "
+        "--dtype in load_plan before delta-RoPE. ~2x smaller store. Changes "
+        "the store layout, so switch on/off => use a fresh --store_url.",
+    )
     args = parser.parse_args()
 
     # Resolve the per-backend default store_url when omitted, so
@@ -894,6 +904,7 @@ def main() -> None:
         store_backend=args.store_backend,
         store_url=args.store_url,
         dtype=getattr(torch, args.dtype),
+        quant="int8" if args.kv_quant else "none",
     )
     index.ingest_instances(instances)
     if not args.oracle_retrieval:

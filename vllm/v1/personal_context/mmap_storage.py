@@ -72,6 +72,7 @@ from __future__ import annotations
 import json
 import mmap
 import os
+import struct
 from typing import Optional
 
 import torch
@@ -104,6 +105,7 @@ def _config_to_dict(c: StoreConfig) -> dict:
         "num_kv_heads": c.num_kv_heads,
         "head_dim": c.head_dim,
         "block_size": c.block_size,
+        "quant": c.quant,
     }
 
 
@@ -116,6 +118,7 @@ def _config_from_dict(d: dict) -> StoreConfig:
         num_kv_heads=d["num_kv_heads"],
         head_dim=d["head_dim"],
         block_size=d["block_size"],
+        quant=d.get("quant", "none"),
     )
 
 
@@ -147,10 +150,19 @@ class MmapKVStorage:
         self._elems_per_tensor = (
             config.block_size * config.num_kv_heads * config.head_dim
         )
-        self._tensor_bytes = self._elems_per_tensor * self._itemsize
+        # quant="int8": tensors stored as int8 (1 byte) preceded by one
+        # float32 scale per tensor; config.dtype stays the compute/dequant
+        # dtype (applied in load_plan). Record grows by the scales block.
+        self._quant = config.quant == "int8"
+        self._store_dtype = torch.int8 if self._quant else config.dtype
+        self._store_itemsize = 1 if self._quant else self._itemsize
+        self._tensor_bytes = self._elems_per_tensor * self._store_itemsize
         self._tensors_per_block = 2 * config.num_layers  # K + V
+        self._scale_bytes = self._tensors_per_block * 4 if self._quant else 0
         self._record_size = (
-            _OLD_POS_HDR + self._tensors_per_block * self._tensor_bytes
+            _OLD_POS_HDR
+            + self._scale_bytes
+            + self._tensors_per_block * self._tensor_bytes
         )
         self._tensor_shape = (
             config.block_size,
@@ -317,6 +329,14 @@ class MmapKVStorage:
             block.old_pos_start
         ).to_bytes(_OLD_POS_HDR, "little", signed=True)
         p = off + _OLD_POS_HDR
+        # Per-tensor float32 scales (K layers then V layers), only when
+        # quantized; the int8 tensor bytes follow, read back with these scales.
+        if self._quant:
+            scales = list(block.k_scales) + list(block.v_scales)
+            self._mm[p : p + self._scale_bytes] = struct.pack(
+                f"<{len(scales)}f", *scales
+            )
+            p += self._scale_bytes
         # K tensors then V tensors, layer order, raw contiguous CPU bytes.
         # flatten-then-view(uint8): Tensor.view(dtype) only reinterprets the
         # last dim, so flatten to 1-D first to get a clean byte stream
@@ -340,27 +360,41 @@ class MmapKVStorage:
             self._mm[off : off + _OLD_POS_HDR], "little", signed=True
         )
         p = off + _OLD_POS_HDR
+        n = self._config.num_layers
+        # Per-tensor scales precede the int8 tensor bytes when quantized.
+        k_scales: Optional[list[float]] = None
+        v_scales: Optional[list[float]] = None
+        if self._quant:
+            scales = struct.unpack(
+                f"<{self._tensors_per_block}f",
+                self._mm[p : p + self._scale_bytes],
+            )
+            k_scales = list(scales[:n])
+            v_scales = list(scales[n:])
+            p += self._scale_bytes
         # Slice the mapping with mm[a:b], which returns an independent bytes
         # copy (NOT a memoryview): it leaves no exported pointer into the
         # mapping, so a later grow's mm.close()/remap can never raise
-        # BufferError. The copy is a single ~2 MB memcpy — negligible next
-        # to the pickle.loads + socket read it replaces on the Redis path.
-        # frombuffer needs a writable buffer, so wrap in bytearray; clone()
-        # then hands the caller an independent, writable tensor.
+        # BufferError. The copy is a single memcpy — negligible next to the
+        # pickle.loads + socket read it replaces on the Redis path. frombuffer
+        # needs a writable buffer, so wrap in bytearray; clone() then hands the
+        # caller an independent, writable tensor. ``_store_dtype`` is int8 when
+        # quantized (dequantized in load_plan), else config.dtype.
         tensors: list[torch.Tensor] = []
         for _ in range(self._tensors_per_block):
             seg = bytearray(self._mm[p : p + self._tensor_bytes])
             t = (
                 torch.frombuffer(seg, dtype=torch.uint8)
-                .view(self._config.dtype)
+                .view(self._store_dtype)
                 .reshape(self._tensor_shape)
                 .clone()
             )
             tensors.append(t)
             p += self._tensor_bytes
-        n = self._config.num_layers
         return KVBlock(
             keys=tensors[:n],
             values=tensors[n:],
             old_pos_start=old_pos_start,
+            k_scales=k_scales,
+            v_scales=v_scales,
         )

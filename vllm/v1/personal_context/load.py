@@ -57,6 +57,7 @@ def load_plan(
     new_pos_starts: tuple[int, ...] | list[int],
     rope_theta: float = 10000.0,
     device: torch.device | str | None = None,
+    compute_dtype: torch.dtype = torch.float16,
 ) -> LoadedPlan:
     """Materialise loaded blocks for every hit in ``plan_lookup``.
 
@@ -122,6 +123,11 @@ def load_plan(
         values_per_block: dict[int, list] = {}
         if hit_indices:
             num_layers = len(chunk_lookup.blocks[hit_indices[0]].block.keys)
+            # int8-quantized blocks carry per-tensor scales; dequantize the
+            # stacked K/V on-device to ``compute_dtype`` before delta-RoPE.
+            is_quant = (
+                chunk_lookup.blocks[hit_indices[0]].block.k_scales is not None
+            )
             # ---- TEMP instrumentation: VLLM_PC_TIME_ROPE=1 splits the
             # batched path into stack / move-to-GPU / rotate to find where
             # load_plan's ~470ms actually goes (CPU rotate vs stack vs
@@ -165,6 +171,17 @@ def load_plan(
                 _PROF_ACC["k_move"] += _time.perf_counter() - _ts2
                 _PROF_ACC["stack"] += _t_stack
                 _ts2 = _time.perf_counter()
+            if is_quant:
+                k_scales = torch.tensor(
+                    [
+                        chunk_lookup.blocks[i].block.k_scales[layer]
+                        for i in hit_indices
+                        for layer in range(num_layers)
+                    ],
+                    device=stacked.device,
+                    dtype=compute_dtype,
+                ).view(-1, 1, 1, 1)
+                stacked = stacked.to(compute_dtype) * k_scales
             rotated = apply_delta_rope_batched(
                 stacked, delta, rope_theta=rope_theta
             )
@@ -203,6 +220,17 @@ def load_plan(
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 _PROF_ACC["v_move"] += _time.perf_counter() - _ts2
+            if is_quant:
+                v_scales = torch.tensor(
+                    [
+                        chunk_lookup.blocks[i].block.v_scales[layer]
+                        for i in hit_indices
+                        for layer in range(num_layers)
+                    ],
+                    device=v_stacked.device,
+                    dtype=compute_dtype,
+                ).view(-1, 1, 1, 1)
+                v_stacked = v_stacked.to(compute_dtype) * v_scales
             for slot, i in enumerate(hit_indices):
                 base = slot * num_layers
                 values_per_block[i] = [
