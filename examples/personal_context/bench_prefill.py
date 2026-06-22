@@ -83,6 +83,9 @@ if str(_REPO_ROOT) not in sys.path:
 from examples.personal_context.chunk_encoder_hf import (  # noqa: E402
     preset_for,
 )
+from examples.personal_context.fact_recall import (  # noqa: E402
+    fact_recall as _fact_recall,
+)
 from examples.personal_context.rag_demo import (  # noqa: E402
     DEFAULT_DATA_PATH,
     DEFAULT_EMBEDDER,
@@ -134,6 +137,7 @@ class Measurement:
     generated_text: str
     rouge_l: float
     cos_sim: float
+    fact_recall: float  # NaN when the gold answer has no extractable facts
 
 
 # ----------------------------- helpers -----------------------------
@@ -200,8 +204,8 @@ def _score_generation(
     gen_text: str,
     embedder,
     rouge_scorer,
-) -> tuple[float, float]:
-    """Compute (ROUGE-L F1, cosine similarity) of gen against gold."""
+) -> tuple[float, float, float]:
+    """Compute (ROUGE-L F1, cosine similarity, fact-recall) of gen vs gold."""
     rouge_l = rouge_scorer.score(gold_text, gen_text)["rougeL"].fmeasure
 
     # normalize_embeddings=True so we can use plain dot product as
@@ -213,7 +217,13 @@ def _score_generation(
         convert_to_numpy=True,
     )
     cos_sim = float((vecs[0] * vecs[1]).sum())
-    return float(rouge_l), cos_sim
+
+    # fact-recall: fraction of gold's money/date/time/name/number atoms that
+    # survive in the generation. Sensitive to single-fact flips ($480->$920)
+    # that cosine rates ~unchanged. None when gold has no extractable facts ->
+    # NaN so the (NaN-aware) per-r AVG skips it.
+    fr, _found, _missed = _fact_recall(gold_text, gen_text)
+    return float(rouge_l), cos_sim, (fr if fr is not None else float("nan"))
 
 
 def _median_p10_p90(values: list[float]) -> tuple[float, float, float]:
@@ -368,14 +378,14 @@ def _bench_for_r(
             ttft_ms = metrics.first_token_latency * 1000.0
 
             gen_text = out.outputs[0].text
-            rouge_l, cos_sim = _score_generation(
+            rouge_l, cos_sim, fact_recall = _score_generation(
                 spec.gold_text, gen_text, embedder, rouge_scorer
             )
 
             print(
                 f"[bench] {r_label}: {spec.instance_id}: "
                 f"TTFT={ttft_ms:7.1f}ms  "
-                f"rougeL={rouge_l:.3f}  cos={cos_sim:.3f}  "
+                f"rougeL={rouge_l:.3f}  cos={cos_sim:.3f}  fr={fact_recall:.2f}  "
                 f"| {gen_text[:80]!r}{'...' if len(gen_text) > 80 else ''}"
             )
             measurements.append(
@@ -385,6 +395,7 @@ def _bench_for_r(
                     generated_text=gen_text,
                     rouge_l=rouge_l,
                     cos_sim=cos_sim,
+                    fact_recall=fact_recall,
                 )
             )
     finally:
@@ -569,6 +580,19 @@ def _print_report(
         getter=lambda m: m.cos_sim,
     )
 
+    # ---- Fact-recall table ----
+    _print_quality_table(
+        "Fact-recall per (r, instance)  — gold facts present in generation",
+        "Money/date/time/name/number atoms of gold found in gen. Catches "
+        "value flips ($480->$920) cosine misses; read as RELATIVE (mildly "
+        "rewards verbosity). NaN = gold had no extractable facts.",
+        results,
+        query_specs,
+        r_values,
+        header_cells,
+        getter=lambda m: m.fact_recall,
+    )
+
     # ---- Recovery ----
     _print_recovery(results, query_specs, r_values)
 
@@ -585,7 +609,8 @@ def _print_report(
             m = results[k][i]
             label = "vanilla" if k == VANILLA_KEY else f"r={k}"
             print(
-                f"\n  {label}  (rougeL={m.rouge_l:.3f}, cos={m.cos_sim:.3f})"
+                f"\n  {label}  (rougeL={m.rouge_l:.3f}, cos={m.cos_sim:.3f}, "
+                f"fr={m.fact_recall:.2f})"
             )
             # Indent the generation for readability.
             for line in m.generated_text.strip().splitlines() or [""]:
@@ -613,7 +638,11 @@ def _print_report(
     print(
         "3. ROUGE catches lexical / single-token errors that perplexity\n"
         "   averaging dilutes. Cosine catches paraphrasing-but-correct\n"
-        "   cases ROUGE penalises. Use both, not either alone."
+        "   cases ROUGE penalises. Fact-recall checks whether gold's\n"
+        "   money/date/time/name/number atoms survive — catching value\n"
+        "   flips ($480->$920) that cosine rates ~unchanged. Fact-recall is\n"
+        "   relative (it mildly rewards verbosity), so compare columns, not\n"
+        "   the absolute value. Use all three, not any one alone."
     )
 
 
@@ -638,7 +667,11 @@ def _print_quality_table(
         print(row)
     print(f"  {'AVG':<20}", end="")
     for r in r_values:
-        avg = sum(getter(m) for m in results[r]) / len(results[r])
+        # NaN-aware (fact-recall is NaN when a gold answer has no facts;
+        # nan != nan, so this drops them without an import).
+        vals = [getter(m) for m in results[r]]
+        vals = [v for v in vals if v == v]
+        avg = sum(vals) / len(vals) if vals else float("nan")
         print(f"{avg:>10.3f}  ", end="")
     print()
 
